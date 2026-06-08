@@ -163,6 +163,35 @@ def insert_content(
         return int(cur.lastrowid)
 
 
+def prune_to_keep(language: str, source: str, keep: int) -> list[str]:
+    """Keep at most ``keep`` items of ``source`` for ``language``; delete the rest.
+
+    Returns the audio paths of deleted rows so the caller can unlink the files.
+    Least-used items are kept. Any sent_history rows for deleted content are
+    removed first to satisfy the foreign key.
+    """
+    if keep < 0:
+        return []
+    with _connect() as conn:
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM content_pool WHERE language = ? AND source = ? "
+                "ORDER BY used_count ASC, id ASC",
+                (language, source),
+            ).fetchall()
+        ]
+        to_delete = ids[keep:]
+        paths: list[str] = []
+        for cid in to_delete:
+            row = conn.execute("SELECT audio_path FROM content_pool WHERE id = ?", (cid,)).fetchone()
+            if row and row["audio_path"]:
+                paths.append(row["audio_path"])
+            conn.execute("DELETE FROM sent_history WHERE content_id = ?", (cid,))
+            conn.execute("DELETE FROM content_pool WHERE id = ?", (cid,))
+        return paths
+
+
 def count_content(language: str | None = None) -> int:
     with _connect() as conn:
         if language:

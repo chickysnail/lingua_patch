@@ -261,6 +261,16 @@ async def maybe_seed_on_start() -> None:
     from generate_content import seed  # local import to avoid a heavy import at module load
 
     for code in codes:
+        if settings.keep_tatoeba > 0:
+            removed = db.prune_to_keep(code, "tatoeba", settings.keep_tatoeba)
+            for path in removed:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if removed:
+                log.info("Pruned %d tatoeba item(s) for %s (keeping %d).", len(removed), code, settings.keep_tatoeba)
+
         have = db.count_content(code)
         if have >= settings.seed_count:
             log.info("Seed-on-start: %s already has %d items, skipping.", code, have)

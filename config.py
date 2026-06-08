@@ -14,6 +14,23 @@ class Settings(BaseSettings):
     # Secrets
     bot_token: str = ""
     openai_api_key: str = ""
+    elevenlabs_api_key: str = ""
+
+    # Audio source for patches: "elevenlabs" (AI voice, any text) or "tatoeba"
+    # (real native-speaker recordings, limited pool). YouGlish word links are added
+    # regardless of source.
+    audio_source: str = "elevenlabs"
+
+    # ElevenLabs settings. eleven_multilingual_v2 = best quality (1 credit/char);
+    # eleven_flash_v2_5 = ~half the cost. Leave voice ids empty to use the curated
+    # multilingual pool (a random voice is picked per clip for variety).
+    elevenlabs_model: str = "eleven_multilingual_v2"
+    elevenlabs_voice_ids: str = ""
+
+    # On boot, cap how many 'tatoeba'-source items to keep per seeded language
+    # (deleting the excess + their audio). 0 = keep all. Useful when switching the
+    # audio source but wanting to retain a few real native recordings.
+    keep_tatoeba: int = 0
 
     # Admin who may use /test_send (numeric Telegram user id). 0 disables the command.
     admin_id: int = 0

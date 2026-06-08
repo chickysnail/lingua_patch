@@ -35,6 +35,13 @@ NATIVE_NAMES = {
     "ukr": "Ukrainian",
 }
 
+# ISO 639-3 -> ISO 639-1, the code ElevenLabs flash/turbo models accept to pin the
+# spoken language (multilingual_v2 auto-detects, so this is best-effort).
+ISO_639_1 = {
+    "ukr": "uk", "rus": "ru", "spa": "es", "fra": "fr", "deu": "de",
+    "ita": "it", "por": "pt", "pol": "pl", "eng": "en",
+}
+
 
 def is_supported(code: str) -> bool:
     return code in LANGUAGES
