@@ -26,23 +26,44 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("seed")
 
 
-def seed(language: str, native: str, count: int, source: str | None = None) -> int:
-    """Seed ``count`` items for ``language`` using the configured audio source."""
+def seed(language: str, native: str, count: int, kind: str = "long") -> int:
+    """Seed ``count`` items of a given ``kind`` ("short" or "long") for ``language``.
+
+    "long" items are always AI-voiced (ElevenLabs) 2-4 sentence snippets. "short"
+    items mix real native clips (Tatoeba) with one-sentence AI snippets so each
+    short pull randomly turns out native or AI; if a language has no native audio,
+    the whole short pool falls back to AI.
+    """
     db.init_db()
-    source = source or settings.audio_source
-    if source == "elevenlabs":
-        return seed_elevenlabs(language, native, count)
-    return seed_tatoeba(language, native, count)
+    if kind == "short":
+        return seed_short(language, native, count)
+    return seed_tts(language, native, count, length="long")
 
 
-def seed_elevenlabs(language: str, native: str, count: int) -> int:
+def seed_short(language: str, native: str, count: int) -> int:
+    """Fill the short pool with a native/AI mix (native first, AI for the rest)."""
+    native_target = round(count * settings.short_native_ratio)
+    inserted_native = 0
+    if native_target > 0:
+        try:
+            inserted_native = seed_tatoeba(language, native, native_target)
+        except Exception as exc:  # noqa: BLE001 - no native audio for this language is fine
+            log.info("No native (Tatoeba) audio for %s (%s); using AI for the short pool.", language, exc)
+    remaining = count - inserted_native
+    inserted_tts = 0
+    if remaining > 0:
+        inserted_tts = seed_tts(language, native, remaining, length="short")
+    return inserted_native + inserted_tts
+
+
+def seed_tts(language: str, native: str, count: int, length: str = "long") -> int:
     """Generate themed snippets with OpenAI and voice them with ElevenLabs."""
     import tts
 
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is required to generate snippet text.")
     if not settings.elevenlabs_api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY is required for the elevenlabs audio source.")
+        raise RuntimeError("ELEVENLABS_API_KEY is required for AI-voiced snippets.")
     openai_client = OpenAI(api_key=settings.openai_api_key)
 
     inserted = 0
@@ -50,7 +71,7 @@ def seed_elevenlabs(language: str, native: str, count: int) -> int:
     while inserted < count and attempts < count * 3:
         attempts += 1
         try:
-            snippet = content_mod.generate_snippet(language, native, client=openai_client)
+            snippet = content_mod.generate_snippet(language, native, client=openai_client, length=length)
         except Exception as exc:  # noqa: BLE001
             log.warning("Snippet generation failed: %s", exc)
             continue
@@ -79,14 +100,15 @@ def seed_elevenlabs(language: str, native: str, count: int) -> int:
             vocabulary=snippet["vocabulary"],
             source="elevenlabs",
             attribution=voice_name,
+            length=length,
         )
         inserted += 1
-        log.info("[%d/%d] seeded TTS id=%d voice=%s theme=%s words=%d: %s",
-                 inserted, count, cid, voice_name, snippet["theme"],
+        log.info("[%d/%d] seeded %s TTS id=%d voice=%s theme=%s words=%d: %s",
+                 inserted, count, length, cid, voice_name, snippet["theme"],
                  len(snippet["vocabulary"]), snippet["transcript"][:70])
 
-    log.info("Done. Inserted %d new TTS items. Pool now has %d items for %s.",
-             inserted, db.count_content(language), language)
+    log.info("Done. Inserted %d new %s TTS items. Pool now has %d items for %s.",
+             inserted, length, db.count_content(language), language)
     return inserted
 
 
@@ -157,6 +179,7 @@ def seed_tatoeba(language: str, native: str, count: int) -> int:
             vocabulary=vocabulary,
             source="tatoeba",
             attribution=attribution,
+            length="short",
         )
         inserted += 1
         log.info("[%d/%d] seeded content id=%d tatoeba=%s words=%d: %s",
@@ -172,12 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--language", default=settings.default_language, help="target ISO 639-3 code, e.g. ukr")
     parser.add_argument("--native", default=settings.native_language, help="native ISO 639-3 code, e.g. rus")
     parser.add_argument("--count", type=int, default=10, help="number of items to seed")
-    parser.add_argument("--source", choices=["elevenlabs", "tatoeba"], default=None,
-                        help="audio source (defaults to AUDIO_SOURCE / config)")
+    parser.add_argument("--kind", choices=["short", "long"], default="long",
+                        help="patch length: 'short' (native+AI mix) or 'long' (AI snippet)")
     args = parser.parse_args(argv)
 
     try:
-        seed(args.language, args.native, args.count, source=args.source)
+        seed(args.language, args.native, args.count, kind=args.kind)
     except content_mod.TatoebaError as exc:
         log.error("Tatoeba error: %s", exc)
         return 1

@@ -16,11 +16,6 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
 
-    # Audio source for patches: "elevenlabs" (AI voice, any text) or "tatoeba"
-    # (real native-speaker recordings, limited pool). YouGlish word links are added
-    # regardless of source.
-    audio_source: str = "elevenlabs"
-
     # ElevenLabs settings. eleven_multilingual_v2 = best quality (1 credit/char);
     # eleven_flash_v2_5 = ~half the cost. Leave voice ids empty to use the curated
     # multilingual pool (a random voice is picked per clip for variety).
@@ -32,15 +27,23 @@ class Settings(BaseSettings):
     # audio source but wanting to retain a few real native recordings.
     keep_tatoeba: int = 0
 
-    # Two on-demand patch styles. "short" = a single native sentence (Tatoeba);
-    # "long" = a 2-4 sentence AI-voiced snippet (ElevenLabs). The daily auto-send
-    # uses the long one.
-    short_source: str = "tatoeba"
-    long_source: str = "elevenlabs"
-    # When a user's unsent items for a given source fall below this, the bot tops
+    # Two on-demand patch styles, by LENGTH. "short" = one sentence; "long" = a
+    # 2-4 sentence snippet. Each length pool mixes real native clips (Tatoeba) and
+    # AI-voiced ones (ElevenLabs), so the source is random per pull. The daily
+    # auto-send always uses the long style.
+    daily_length: str = "long"
+    # Fraction of the *short* pool seeded from real native (Tatoeba) audio; the
+    # rest is one-sentence AI snippets. Languages without native audio fall back
+    # to all-AI automatically. (The long pool is AI-only — no native long audio.)
+    short_native_ratio: float = 0.5
+    # When a user's unsent items for a given length fall below this, the bot tops
     # the pool up in the background so the buttons never go dry.
     topup_threshold: int = 3
     topup_count: int = 5
+    # How many items per length to seed the first time a user switches to a
+    # language that has no content yet (kept small so the switch feels instant;
+    # the background top-up grows the pool from there).
+    switch_seed_count: int = 4
 
     # Admin who may use /test_send (numeric Telegram user id). 0 disables the command.
     admin_id: int = 0

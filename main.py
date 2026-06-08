@@ -45,37 +45,55 @@ router = Router()
 # --------------------------------------------------------------------------- #
 # Core delivery
 # --------------------------------------------------------------------------- #
-_topup_inflight: set[tuple[str, str]] = set()
+_seed_inflight: set[tuple[str, str]] = set()
 
 
-async def _topup_pool(language: str, native: str, source: str) -> None:
-    """Background top-up so a source's pool never runs dry. De-duped per (lang, source)."""
-    key = (language, source)
-    if key in _topup_inflight:
-        return
-    _topup_inflight.add(key)
+async def _seed_pool(language: str, native: str, kind: str, count: int) -> int:
+    """Background-seed ``count`` items of a length ``kind`` for a language.
+
+    De-duped per (language, kind) so concurrent taps don't fire duplicate seeds.
+    Used both for first-time language setup and to keep a pool topped up.
+    """
+    key = (language, kind)
+    if key in _seed_inflight:
+        return 0
+    _seed_inflight.add(key)
     try:
         from generate_content import seed
-        added = await asyncio.to_thread(seed, language, native, settings.topup_count, source)
-        log.info("Topped up %s/%s pool with %d item(s).", language, source, added)
+        added = await asyncio.to_thread(seed, language, native, count, kind)
+        log.info("Seeded %d %s item(s) for %s.", added, kind, language)
+        return added
     except Exception as exc:  # noqa: BLE001
-        log.warning("Top-up failed for %s/%s: %s", language, source, exc)
+        log.warning("Seeding failed for %s/%s: %s", language, kind, exc)
+        return 0
     finally:
-        _topup_inflight.discard(key)
+        _seed_inflight.discard(key)
 
 
-async def deliver(bot: Bot, user: dict[str, Any], source: str | None = None) -> bool:
+def ensure_language_seeded(language: str, native: str) -> None:
+    """Kick off background seeding for any length pool that is empty for a language.
+
+    Lets a freshly-switched language work without a manual seed step: TTS always
+    succeeds; native clips are added when Tatoeba has them.
+    """
+    for kind in ("short", "long"):
+        if db.count_content(language, length=kind) == 0:
+            asyncio.create_task(_seed_pool(language, native, kind, settings.switch_seed_count))
+
+
+async def deliver(bot: Bot, user: dict[str, Any], length: str | None = None) -> bool:
     """Send one patch to a user. Returns True if delivered.
 
-    ``source`` picks the patch style ("tatoeba" short / "elevenlabs" long); None
-    means any source. On TelegramForbiddenError (user blocked the bot) the user is
-    deactivated. Any content with a missing audio file is skipped safely.
+    ``length`` picks the patch style ("short" one sentence / "long" 2-4 sentences);
+    None means any length. The audio source (native vs AI) varies within a length.
+    On TelegramForbiddenError (user blocked the bot) the user is deactivated. Any
+    content with a missing audio file is skipped safely.
     """
     user_id = user["user_id"]
     language = user["language"]
-    content = db.pick_unsent_content(user_id, language, source=source)
+    content = db.pick_unsent_content(user_id, language, length=length)
     if content is None:
-        log.info("No content available for user %s (language=%s, source=%s).", user_id, language, source)
+        log.info("No content available for user %s (language=%s, length=%s).", user_id, language, length)
         return False
 
     audio_path = Path(content["audio_path"])
@@ -95,9 +113,9 @@ async def deliver(bot: Bot, user: dict[str, Any], source: str | None = None) -> 
         return False
 
     db.record_sent(user_id, content["id"])
-    if source and db.count_unsent(user_id, language, source=source) < settings.topup_threshold:
+    if length and db.count_unsent(user_id, language, length=length) < settings.topup_threshold:
         native = user.get("native_language", settings.native_language)
-        asyncio.create_task(_topup_pool(language, native, source))
+        asyncio.create_task(_seed_pool(language, native, length, settings.topup_count))
     return True
 
 
@@ -106,8 +124,8 @@ async def deliver_to_all(bot: Bot) -> int:
     log.info("Daily run: delivering to %d active user(s).", len(users))
     sent = 0
     for user in users:
-        # The daily auto-send is always the longer AI snippet.
-        if await deliver(bot, user, source=settings.long_source):
+        # The daily auto-send is always the longer style.
+        if await deliver(bot, user, length=settings.daily_length):
             sent += 1
     log.info("Daily run complete: %d delivered.", sent)
     return sent
@@ -186,14 +204,26 @@ def _patch_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-async def send_patch_now(message: Message, bot: Bot, source: str) -> None:
+async def send_patch_now(message: Message, bot: Bot, length: str) -> None:
     """On-demand delivery: anyone can ask for a patch right now (button or command)."""
     db.upsert_user(message.from_user.id)
-    delivered = await deliver(bot, db.get_user(message.from_user.id), source=source)
+    user = db.get_user(message.from_user.id)
+    delivered = await deliver(bot, user, length=length)
     if not delivered:
+        # Pool not ready for this language yet — start preparing it in the background.
+        native = user.get("native_language", settings.native_language)
+        ensure_language_seeded(user["language"], native)
         await message.answer(
-            "Поки що немає контенту для цієї мови 😔 Спробуй іншу через /language."
+            "Готую перші патчі для цієї мови — спробуй ще раз за хвилину 🙏"
         )
+
+
+def _switch_message(code: str) -> str:
+    lang = get(code)
+    base = f"Готово! Тепер ти вчиш: {lang.flag} <b>{lang.name}</b>."
+    if db.count_content(code) == 0:
+        base += "\n\nГотую перші патчі для цієї мови — це займе до хвилини. Потім тисни 📻/🎧."
+    return base
 
 
 def _language_keyboard() -> InlineKeyboardMarkup:
@@ -236,8 +266,8 @@ async def cmd_language(message: Message, command: CommandObject) -> None:
             await message.answer(f"Не знаю мову <code>{arg}</code>. Доступні: {supported}")
             return
         db.set_user_language(message.from_user.id, arg)
-        lang = get(arg)
-        await message.answer(f"Готово! Тепер ти вчиш: {lang.flag} <b>{lang.name}</b>.")
+        await message.answer(_switch_message(arg))
+        ensure_language_seeded(arg, settings.native_language)
         return
     await message.answer("Обери мову, яку хочеш вчити:", reply_markup=_language_keyboard())
 
@@ -250,34 +280,34 @@ async def on_set_language(callback: CallbackQuery) -> None:
         return
     db.upsert_user(callback.from_user.id)
     db.set_user_language(callback.from_user.id, code)
-    lang = get(code)
-    await callback.message.edit_text(f"Готово! Тепер ти вчиш: {lang.flag} <b>{lang.name}</b>.")
+    await callback.message.edit_text(_switch_message(code))
+    ensure_language_seeded(code, settings.native_language)
     await callback.answer()
 
 
 @router.message(Command("patch", "test_send"))
 async def cmd_patch(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot, source=settings.long_source)
+    await send_patch_now(message, bot, length="long")
 
 
 @router.message(Command("short"))
 async def cmd_short(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot, source=settings.short_source)
+    await send_patch_now(message, bot, length="short")
 
 
 @router.message(F.text == LONG_PATCH_TEXT)
 async def on_long_button(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot, source=settings.long_source)
+    await send_patch_now(message, bot, length="long")
 
 
 @router.message(F.text == SHORT_PATCH_TEXT)
 async def on_short_button(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot, source=settings.short_source)
+    await send_patch_now(message, bot, length="short")
 
 
 @router.message(F.text == LEGACY_PATCH_TEXT)
 async def on_legacy_button(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot, source=settings.long_source)
+    await send_patch_now(message, bot, length="long")
 
 
 async def setup_commands(bot: Bot) -> None:
@@ -306,8 +336,7 @@ async def maybe_seed_on_start() -> None:
         return
     from generate_content import seed  # local import to avoid a heavy import at module load
 
-    # Both patch styles get their own pool, each topped up to SEED_COUNT.
-    sources = [settings.short_source, settings.long_source]
+    # Both length pools (short + long) are topped up to SEED_COUNT independently.
     for code in codes:
         if settings.keep_tatoeba > 0:
             removed = db.prune_to_keep(code, "tatoeba", settings.keep_tatoeba)
@@ -319,17 +348,17 @@ async def maybe_seed_on_start() -> None:
             if removed:
                 log.info("Pruned %d tatoeba item(s) for %s (keeping %d).", len(removed), code, settings.keep_tatoeba)
 
-        for src in sources:
-            have = db.count_content(code, source=src)
+        for kind in ("short", "long"):
+            have = db.count_content(code, length=kind)
             need = settings.seed_count - have
             if need <= 0:
-                log.info("Seed-on-start: %s/%s already has %d items, skipping.", code, src, have)
+                log.info("Seed-on-start: %s/%s already has %d items, skipping.", code, kind, have)
                 continue
-            log.info("Seed-on-start: topping up %s/%s (have %d, want %d)...", code, src, have, settings.seed_count)
+            log.info("Seed-on-start: topping up %s/%s (have %d, want %d)...", code, kind, have, settings.seed_count)
             try:
-                await asyncio.to_thread(seed, code, settings.native_language, need, src)
+                await asyncio.to_thread(seed, code, settings.native_language, need, kind)
             except Exception as exc:  # noqa: BLE001
-                log.exception("Seed-on-start failed for %s/%s: %s", code, src, exc)
+                log.exception("Seed-on-start failed for %s/%s: %s", code, kind, exc)
 
 
 async def main() -> None:
