@@ -249,11 +249,36 @@ async def setup_commands(bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
+async def maybe_seed_on_start() -> None:
+    """Top up the content pool on boot for languages listed in SEED_ON_START.
+
+    Keeps a fresh deploy (e.g. an empty Railway volume) usable without a manual
+    seeding step. Runs the synchronous seeder off the event loop.
+    """
+    codes = [c.strip() for c in settings.seed_on_start.split(",") if c.strip()]
+    if not codes:
+        return
+    from generate_content import seed  # local import to avoid a heavy import at module load
+
+    for code in codes:
+        have = db.count_content(code)
+        if have >= settings.seed_count:
+            log.info("Seed-on-start: %s already has %d items, skipping.", code, have)
+            continue
+        log.info("Seed-on-start: topping up %s (have %d, want %d)...", code, have, settings.seed_count)
+        try:
+            await asyncio.to_thread(seed, code, settings.native_language, settings.seed_count)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Seed-on-start failed for %s: %s", code, exc)
+
+
 async def main() -> None:
     if not settings.bot_token:
         raise SystemExit("BOT_TOKEN is not set. Add it to the environment or .env file.")
 
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     db.init_db()
+    await maybe_seed_on_start()
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)

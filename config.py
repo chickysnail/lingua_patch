@@ -32,9 +32,15 @@ class Settings(BaseSettings):
     default_language: str = "ukr"  # target language the user is learning
     native_language: str = "rus"   # the user's mother tongue (used for translations + diffing)
 
-    # Paths.
+    # Paths. Point these at a persistent volume in production (e.g. /data on Railway).
     db_path: Path = BASE_DIR / "bot.db"
     media_dir: Path = BASE_DIR / "media"
+
+    # Optional auto-seed on startup: comma-separated target codes (e.g. "ukr,spa").
+    # On boot, any listed language whose pool has fewer than seed_count items is
+    # topped up from Tatoeba. Leave empty to disable (seed manually instead).
+    seed_on_start: str = ""
+    seed_count: int = 10
 
 
 settings = Settings()

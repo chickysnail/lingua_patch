@@ -63,6 +63,26 @@ next send automatically.
 > always-on (a small VPS / container / systemd service) for reliable daily
 > delivery.
 
+## Deploy to Railway
+
+The bot is a long-polling **worker** (no web port). A `Dockerfile` (with ffmpeg)
+and `railway.json` are included.
+
+1. **New Project → Deploy from GitHub repo** → pick `lingua_patch`. Railway builds
+   the Dockerfile automatically.
+2. **Variables:** set `BOT_TOKEN` and `OPENAI_API_KEY` (and optionally `ADMIN_ID`,
+   `TIMEZONE`, `SEND_WINDOW_START_HOUR`, `SEND_WINDOW_END_HOUR`).
+3. **Volume:** add a volume mounted at **`/data`** (the image already points
+   `DB_PATH=/data/bot.db` and `MEDIA_DIR=/data/media` there) so the DB + audio
+   survive redeploys.
+4. **Seed the pool** — pick one:
+   - Set `SEED_ON_START=ukr` (and optional `SEED_COUNT`, default 10). On first boot
+     the bot tops up the pool from Tatoeba into the volume. You can remove it after
+     the first successful boot.
+   - Or run a one-off in the service shell: `python generate_content.py --language ukr --count 10`.
+
+No healthcheck/port is needed — it's a worker, not a web service.
+
 ## Commands
 
 | Command / button        | Who      | What |
