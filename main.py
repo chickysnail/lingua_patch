@@ -20,7 +20,6 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
-    BotCommandScopeChat,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -147,34 +146,26 @@ async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------------- #
-PATCH_NOW_TEXT = "🎧 Патч зараз"
+PATCH_NOW_TEXT = "🎧 Хочу патч зараз"
 
 
-def _is_admin(user_id: int) -> bool:
-    return bool(settings.admin_id) and user_id == settings.admin_id
-
-
-def _admin_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent reply keyboard giving the admin a one-tap 'send a patch now' button."""
+def _patch_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent reply keyboard giving every user a one-tap 'patch me now' button."""
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=PATCH_NOW_TEXT)]],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Натисни 🎧 Патч зараз",
+        input_field_placeholder="Натисни 🎧 Хочу патч зараз",
     )
 
 
 async def send_patch_now(message: Message, bot: Bot) -> None:
-    """Shared handler for the admin /test_send command and the 🎧 button."""
-    if not _is_admin(message.from_user.id):
-        await message.answer("⛔ Ця команда лише для адміністратора.")
-        return
+    """On-demand delivery: anyone can ask for a patch right now (button or /patch)."""
     db.upsert_user(message.from_user.id)
     delivered = await deliver(bot, db.get_user(message.from_user.id))
     if not delivered:
         await message.answer(
-            "Не вдалося надіслати патч — у пулі немає контенту для цієї мови. "
-            "Запусти <code>python generate_content.py --language &lt;код&gt;</code>."
+            "Поки що немає контенту для цієї мови 😔 Спробуй іншу через /language."
         )
 
 
@@ -198,9 +189,10 @@ async def cmd_start(message: Message) -> None:
         "реальний голос носія, текст, переклад і кілька слів, що найбільше "
         f"відрізняються від рідної мови.\n\nЗараз ти вчиш: <b>{current}</b>.\n\n"
         "Команди:\n"
+        "• /patch — хочу слова прямо зараз 🎧\n"
         "• /language — змінити мову\n"
-        "• раз на день у випадковий час (як BeReal) прийде новий патч 🎧",
-        reply_markup=_admin_keyboard() if _is_admin(message.from_user.id) else None,
+        "• раз на день у випадковий час (як BeReal) сам прийде новий патч",
+        reply_markup=_patch_keyboard(),
     )
 
 
@@ -233,8 +225,8 @@ async def on_set_language(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.message(Command("test_send"))
-async def cmd_test_send(message: Message, bot: Bot) -> None:
+@router.message(Command("patch", "test_send"))
+async def cmd_patch(message: Message, bot: Bot) -> None:
     await send_patch_now(message, bot)
 
 
@@ -244,17 +236,14 @@ async def on_patch_now_button(message: Message, bot: Bot) -> None:
 
 
 async def setup_commands(bot: Bot) -> None:
-    """Populate the Telegram command menu (and add /test_send only for the admin)."""
-    base = [
-        BotCommand(command="start", description="Почати / показати поточну мову"),
-        BotCommand(command="language", description="Змінити мову, яку вчиш"),
-    ]
-    await bot.set_my_commands(base)
-    if settings.admin_id:
-        await bot.set_my_commands(
-            base + [BotCommand(command="test_send", description="Надіслати патч зараз (адмін)")],
-            scope=BotCommandScopeChat(chat_id=settings.admin_id),
-        )
+    """Populate the public Telegram command menu."""
+    await bot.set_my_commands(
+        [
+            BotCommand(command="patch", description="Хочу патч зараз 🎧"),
+            BotCommand(command="language", description="Змінити мову, яку вчиш"),
+            BotCommand(command="start", description="Почати / показати поточну мову"),
+        ]
+    )
 
 
 # --------------------------------------------------------------------------- #

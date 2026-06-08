@@ -65,11 +65,14 @@ next send automatically.
 
 ## Commands
 
-| Command       | Who      | What |
-|---------------|----------|------|
-| `/start`      | everyone | Register and see your current language. |
-| `/language`   | everyone | Switch the language you're learning (buttons, or `/language spa`). |
-| `/test_send`  | admin    | Immediately deliver today's patch (for testing). Restricted to `ADMIN_ID`. |
+| Command / button        | Who      | What |
+|--------------------------|----------|------|
+| `/start`                 | everyone | Register, see your current language, and get the 🎧 button. |
+| `/patch` or 🎧 button     | everyone | On-demand: "I want some words right now" — sends a patch immediately. |
+| `/language`              | everyone | Switch the language you're learning (buttons, or `/language spa`). |
+
+The persistent **🎧 Хочу патч зараз** keyboard button is a one-tap alias for
+`/patch`. (`/test_send` is kept as a hidden alias of `/patch`.)
 
 ## Configuration
 
