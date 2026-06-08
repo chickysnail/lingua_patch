@@ -49,7 +49,11 @@ def build_message(content: dict[str, Any]) -> str:
             lines.append(f"• <a href=\"{link}\">{escape(word)}</a> — {translation_w}{ctx}")
 
     attribution = content.get("attribution")
+    source = content.get("source") or "tatoeba"
     if attribution:
-        lines += ["", f"<a href=\"{escape(attribution)}\">audio: Tatoeba (CC-BY)</a>"]
+        if source == "elevenlabs":
+            lines += ["", f"🔊 <i>голос: {escape(attribution)} · ElevenLabs (AI)</i>"]
+        else:
+            lines += ["", f"<a href=\"{escape(attribution)}\">audio: Tatoeba (CC-BY)</a>"]
 
     return "\n".join(lines)

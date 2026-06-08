@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import subprocess
 from pathlib import Path
 from urllib.parse import quote
@@ -16,7 +17,7 @@ from urllib.parse import quote
 import httpx
 
 from config import settings
-from languages import LANGUAGES
+from languages import LANGUAGES, NATIVE_NAMES
 
 log = logging.getLogger(__name__)
 
@@ -148,3 +149,87 @@ def build_vocabulary(
     except Exception as exc:  # noqa: BLE001 - degrade gracefully, log for debugging
         log.warning("Vocabulary generation failed for %r: %s", transcript, exc)
         return []
+
+
+# --------------------------------------------------------------------------- #
+# ElevenLabs / TTS content: generate the text to be spoken
+# --------------------------------------------------------------------------- #
+THEMES = [
+    "morning coffee", "the weather today", "commuting to work", "cooking dinner",
+    "weekend plans", "small talk with a neighbour", "grocery shopping",
+    "feeling tired after a long day", "a funny everyday moment", "calling a friend",
+    "the changing seasons", "a small frustration", "trying something new",
+    "running late", "a quiet evening at home", "planning a trip",
+]
+
+_SNIPPET_SYSTEM = (
+    "You write tiny, natural audio snippets for passive language learning. Given a "
+    "target language, the learner's native language, and a theme, produce 2-4 short, "
+    "natural sentences (about 12-20 seconds when read aloud) in the TARGET language on "
+    "that theme — conversational, like something a native speaker would actually say, "
+    "not a textbook example. Then provide the full translation in the native language, "
+    "and pick the 3-5 words MOST DIFFERENT from the native language (false friends or "
+    "words a native speaker would not guess), each with its dictionary form, the "
+    "native-language translation, and a 2-4 word usage hint. Respond ONLY with JSON: "
+    '{"transcript": "...", "translation": "...", '
+    '"vocabulary": [{"word": "...", "translation": "...", "context": "..."}]}'
+)
+
+
+def generate_snippet(
+    language: str,
+    native_language: str,
+    theme: str | None = None,
+    client=None,
+) -> dict:
+    """Generate a short themed snippet (transcript + translation + vocabulary).
+
+    One OpenAI call produces everything the TTS path needs. Raises on failure so
+    the seeder can skip and try the next one.
+    """
+    if client is None:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.openai_api_key)
+
+    theme = theme or random.choice(THEMES)
+    lang_name = LANGUAGES[language].name if language in LANGUAGES else language
+    native_name = NATIVE_NAMES.get(native_language, native_language)
+    user_msg = (
+        f"Target language: {lang_name} ({language})\n"
+        f"Native language: {native_name} ({native_language})\n"
+        f"Theme: {theme}"
+    )
+    resp = client.chat.completions.create(
+        model=settings.openai_model,
+        messages=[
+            {"role": "system", "content": _SNIPPET_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.8,
+    )
+    payload = json.loads(resp.choices[0].message.content or "{}")
+    transcript = str(payload.get("transcript", "")).strip()
+    if not transcript:
+        raise ValueError("OpenAI returned an empty transcript")
+    translation = str(payload.get("translation", "")).strip() or None
+
+    vocab: list[dict[str, str]] = []
+    for item in payload.get("vocabulary", []):
+        word = str(item.get("word", "")).strip()
+        if not word:
+            continue
+        vocab.append(
+            {
+                "word": word,
+                "translation": str(item.get("translation", "")).strip(),
+                "context": str(item.get("context", "")).strip(),
+            }
+        )
+    return {
+        "transcript": transcript,
+        "translation": translation,
+        "vocabulary": vocab[:5],
+        "theme": theme,
+    }
