@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     # audio source but wanting to retain a few real native recordings.
     keep_tatoeba: int = 0
 
+    # Two on-demand patch styles. "short" = a single native sentence (Tatoeba);
+    # "long" = a 2-4 sentence AI-voiced snippet (ElevenLabs). The daily auto-send
+    # uses the long one.
+    short_source: str = "tatoeba"
+    long_source: str = "elevenlabs"
+    # When a user's unsent items for a given source fall below this, the bot tops
+    # the pool up in the background so the buttons never go dry.
+    topup_threshold: int = 3
+    topup_count: int = 5
+
     # Admin who may use /test_send (numeric Telegram user id). 0 disables the command.
     admin_id: int = 0
 

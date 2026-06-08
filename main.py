@@ -45,17 +45,37 @@ router = Router()
 # --------------------------------------------------------------------------- #
 # Core delivery
 # --------------------------------------------------------------------------- #
-async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
-    """Send one daily patch to a user. Returns True if delivered.
+_topup_inflight: set[tuple[str, str]] = set()
 
-    On TelegramForbiddenError (user blocked the bot) the user is deactivated so
-    we stop trying. Any content with a missing audio file is skipped safely.
+
+async def _topup_pool(language: str, native: str, source: str) -> None:
+    """Background top-up so a source's pool never runs dry. De-duped per (lang, source)."""
+    key = (language, source)
+    if key in _topup_inflight:
+        return
+    _topup_inflight.add(key)
+    try:
+        from generate_content import seed
+        added = await asyncio.to_thread(seed, language, native, settings.topup_count, source)
+        log.info("Topped up %s/%s pool with %d item(s).", language, source, added)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Top-up failed for %s/%s: %s", language, source, exc)
+    finally:
+        _topup_inflight.discard(key)
+
+
+async def deliver(bot: Bot, user: dict[str, Any], source: str | None = None) -> bool:
+    """Send one patch to a user. Returns True if delivered.
+
+    ``source`` picks the patch style ("tatoeba" short / "elevenlabs" long); None
+    means any source. On TelegramForbiddenError (user blocked the bot) the user is
+    deactivated. Any content with a missing audio file is skipped safely.
     """
     user_id = user["user_id"]
     language = user["language"]
-    content = db.pick_unsent_content(user_id, language)
+    content = db.pick_unsent_content(user_id, language, source=source)
     if content is None:
-        log.info("No content available for user %s (language=%s).", user_id, language)
+        log.info("No content available for user %s (language=%s, source=%s).", user_id, language, source)
         return False
 
     audio_path = Path(content["audio_path"])
@@ -75,6 +95,9 @@ async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
         return False
 
     db.record_sent(user_id, content["id"])
+    if source and db.count_unsent(user_id, language, source=source) < settings.topup_threshold:
+        native = user.get("native_language", settings.native_language)
+        asyncio.create_task(_topup_pool(language, native, source))
     return True
 
 
@@ -83,7 +106,8 @@ async def deliver_to_all(bot: Bot) -> int:
     log.info("Daily run: delivering to %d active user(s).", len(users))
     sent = 0
     for user in users:
-        if await deliver(bot, user):
+        # The daily auto-send is always the longer AI snippet.
+        if await deliver(bot, user, source=settings.long_source):
             sent += 1
     log.info("Daily run complete: %d delivered.", sent)
     return sent
@@ -146,23 +170,26 @@ async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------------- #
-PATCH_NOW_TEXT = "🎧 Хочу патч зараз"
+SHORT_PATCH_TEXT = "📻 Коротко"
+LONG_PATCH_TEXT = "🎧 Довше"
+# Older clients may still show the previous single button — keep it working (→ long).
+LEGACY_PATCH_TEXT = "🎧 Хочу патч зараз"
 
 
 def _patch_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent reply keyboard giving every user a one-tap 'patch me now' button."""
+    """Persistent reply keyboard: a short (native) and a long (AI) patch button."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=PATCH_NOW_TEXT)]],
+        keyboard=[[KeyboardButton(text=SHORT_PATCH_TEXT), KeyboardButton(text=LONG_PATCH_TEXT)]],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Натисни 🎧 Хочу патч зараз",
+        input_field_placeholder="📻 Коротко (носій) · 🎧 Довше (AI)",
     )
 
 
-async def send_patch_now(message: Message, bot: Bot) -> None:
-    """On-demand delivery: anyone can ask for a patch right now (button or /patch)."""
+async def send_patch_now(message: Message, bot: Bot, source: str) -> None:
+    """On-demand delivery: anyone can ask for a patch right now (button or command)."""
     db.upsert_user(message.from_user.id)
-    delivered = await deliver(bot, db.get_user(message.from_user.id))
+    delivered = await deliver(bot, db.get_user(message.from_user.id), source=source)
     if not delivered:
         await message.answer(
             "Поки що немає контенту для цієї мови 😔 Спробуй іншу через /language."
@@ -185,13 +212,16 @@ async def cmd_start(message: Message) -> None:
     lang = get(user["language"]) if is_supported(user["language"]) else None
     current = f"{lang.flag} {lang.name}" if lang else user["language"]
     await message.answer(
-        "👋 Привіт! Я надсилатиму тобі <b>один короткий аудіо-патч на день</b> — "
-        "реальний голос носія, текст, переклад і кілька слів, що найбільше "
-        f"відрізняються від рідної мови.\n\nЗараз ти вчиш: <b>{current}</b>.\n\n"
+        "👋 Привіт! Я надсилатиму тобі <b>один аудіо-патч на день</b> — "
+        "текст, переклад і кілька слів, що найбільше відрізняються від рідної "
+        f"мови.\n\nЗараз ти вчиш: <b>{current}</b>.\n\n"
+        "Дві кнопки внизу:\n"
+        "• <b>📻 Коротко</b> — одна фраза голосом носія (Tatoeba)\n"
+        "• <b>🎧 Довше</b> — міні-сценка на 2–4 речення (AI-голос)\n\n"
         "Команди:\n"
-        "• /patch — хочу слова прямо зараз 🎧\n"
+        "• /patch — довший патч 🎧 · /short — коротка фраза 📻\n"
         "• /language — змінити мову\n"
-        "• раз на день у випадковий час (як BeReal) сам прийде новий патч",
+        "• раз на день у випадковий час (як BeReal) сам прийде довший патч",
         reply_markup=_patch_keyboard(),
     )
 
@@ -227,19 +257,35 @@ async def on_set_language(callback: CallbackQuery) -> None:
 
 @router.message(Command("patch", "test_send"))
 async def cmd_patch(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot)
+    await send_patch_now(message, bot, source=settings.long_source)
 
 
-@router.message(F.text == PATCH_NOW_TEXT)
-async def on_patch_now_button(message: Message, bot: Bot) -> None:
-    await send_patch_now(message, bot)
+@router.message(Command("short"))
+async def cmd_short(message: Message, bot: Bot) -> None:
+    await send_patch_now(message, bot, source=settings.short_source)
+
+
+@router.message(F.text == LONG_PATCH_TEXT)
+async def on_long_button(message: Message, bot: Bot) -> None:
+    await send_patch_now(message, bot, source=settings.long_source)
+
+
+@router.message(F.text == SHORT_PATCH_TEXT)
+async def on_short_button(message: Message, bot: Bot) -> None:
+    await send_patch_now(message, bot, source=settings.short_source)
+
+
+@router.message(F.text == LEGACY_PATCH_TEXT)
+async def on_legacy_button(message: Message, bot: Bot) -> None:
+    await send_patch_now(message, bot, source=settings.long_source)
 
 
 async def setup_commands(bot: Bot) -> None:
     """Populate the public Telegram command menu."""
     await bot.set_my_commands(
         [
-            BotCommand(command="patch", description="Хочу патч зараз 🎧"),
+            BotCommand(command="patch", description="Довший патч 🎧 (AI-сценка)"),
+            BotCommand(command="short", description="Коротка фраза 📻 (голос носія)"),
             BotCommand(command="language", description="Змінити мову, яку вчиш"),
             BotCommand(command="start", description="Почати / показати поточну мову"),
         ]
@@ -260,6 +306,8 @@ async def maybe_seed_on_start() -> None:
         return
     from generate_content import seed  # local import to avoid a heavy import at module load
 
+    # Both patch styles get their own pool, each topped up to SEED_COUNT.
+    sources = [settings.short_source, settings.long_source]
     for code in codes:
         if settings.keep_tatoeba > 0:
             removed = db.prune_to_keep(code, "tatoeba", settings.keep_tatoeba)
@@ -271,15 +319,17 @@ async def maybe_seed_on_start() -> None:
             if removed:
                 log.info("Pruned %d tatoeba item(s) for %s (keeping %d).", len(removed), code, settings.keep_tatoeba)
 
-        have = db.count_content(code)
-        if have >= settings.seed_count:
-            log.info("Seed-on-start: %s already has %d items, skipping.", code, have)
-            continue
-        log.info("Seed-on-start: topping up %s (have %d, want %d)...", code, have, settings.seed_count)
-        try:
-            await asyncio.to_thread(seed, code, settings.native_language, settings.seed_count)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Seed-on-start failed for %s: %s", code, exc)
+        for src in sources:
+            have = db.count_content(code, source=src)
+            need = settings.seed_count - have
+            if need <= 0:
+                log.info("Seed-on-start: %s/%s already has %d items, skipping.", code, src, have)
+                continue
+            log.info("Seed-on-start: topping up %s/%s (have %d, want %d)...", code, src, have, settings.seed_count)
+            try:
+                await asyncio.to_thread(seed, code, settings.native_language, need, src)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Seed-on-start failed for %s/%s: %s", code, src, exc)
 
 
 async def main() -> None:
