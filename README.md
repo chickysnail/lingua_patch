@@ -53,8 +53,11 @@ This downloads native audio, builds the vocabulary, and inserts rows into
 python main.py
 ```
 
-The bot starts long-polling and an in-process scheduler that fires daily at
-`DAILY_HOUR:DAILY_MINUTE` in `TIMEZONE`.
+The bot starts long-polling and an in-process scheduler that fires **once a day
+at a random time** (BeReal-style) inside the
+`[SEND_WINDOW_START_HOUR, SEND_WINDOW_END_HOUR)` window in `TIMEZONE`. After each
+send it picks a fresh random time for the next day; on restart it re-plans the
+next send automatically.
 
 > The scheduler only fires while the process is running — host it somewhere
 > always-on (a small VPS / container / systemd service) for reliable daily

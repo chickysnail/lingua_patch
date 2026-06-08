@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -23,6 +26,7 @@ from aiogram.types import (
     Message,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
 
 import db
 from config import settings
@@ -83,6 +87,60 @@ async def deliver_to_all(bot: Bot) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# BeReal-style random daily scheduling
+# --------------------------------------------------------------------------- #
+JOB_ID = "daily_patch"
+
+
+def pick_next_run(now: datetime) -> datetime:
+    """Pick the next random delivery time inside the daytime window.
+
+    If today's window has not yet closed, choose a random time later today;
+    otherwise choose a random time tomorrow. A small ``+1`` minute floor avoids
+    scheduling in the past on restarts.
+    """
+    start_h = settings.send_window_start_hour
+    end_h = settings.send_window_end_hour
+    tz = now.tzinfo
+
+    def random_time_on(day: datetime, earliest: datetime | None) -> datetime:
+        window_start = day.replace(hour=start_h, minute=0, second=0, microsecond=0)
+        window_end = day.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        lower = max(window_start, earliest) if earliest else window_start
+        span = int((window_end - lower).total_seconds())
+        offset = random.randint(0, span) if span > 0 else 0
+        return lower + timedelta(seconds=offset)
+
+    todays_end = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+    if now < todays_end:
+        return random_time_on(now, earliest=now + timedelta(minutes=1))
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
+    return random_time_on(tomorrow, earliest=None)
+
+
+def schedule_next(scheduler: AsyncIOScheduler, bot: Bot) -> datetime:
+    tz = ZoneInfo(settings.timezone)
+    run_at = pick_next_run(datetime.now(tz))
+    scheduler.add_job(
+        send_and_reschedule,
+        trigger=DateTrigger(run_date=run_at),
+        args=[scheduler, bot],
+        id=JOB_ID,
+        replace_existing=True,
+    )
+    log.info("Next patch scheduled for %s (%s).", run_at.isoformat(), settings.timezone)
+    return run_at
+
+
+async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
+    try:
+        await deliver_to_all(bot)
+    finally:
+        # Always line up tomorrow's random time, even if today's send failed.
+        schedule_next(scheduler, bot)
+
+
+# --------------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------------- #
 def _language_keyboard() -> InlineKeyboardMarkup:
@@ -106,7 +164,7 @@ async def cmd_start(message: Message) -> None:
         f"відрізняються від рідної мови.\n\nЗараз ти вчиш: <b>{current}</b>.\n\n"
         "Команди:\n"
         "• /language — змінити мову\n"
-        "• кожен день о визначеній годині прийде новий патч 🎧",
+        "• раз на день у випадковий час (як BeReal) прийде новий патч 🎧",
     )
 
 
@@ -166,19 +224,13 @@ async def main() -> None:
     dp.include_router(router)
 
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
-    scheduler.add_job(
-        deliver_to_all,
-        trigger="cron",
-        hour=settings.daily_hour,
-        minute=settings.daily_minute,
-        args=[bot],
-        id="daily_patch",
-        replace_existing=True,
-    )
     scheduler.start()
+    run_at = schedule_next(scheduler, bot)
     log.info(
-        "Scheduler started: daily at %02d:%02d %s. Pool size: %d.",
-        settings.daily_hour, settings.daily_minute, settings.timezone, db.count_content(),
+        "Scheduler started: one random patch/day in [%02d:00, %02d:00) %s. "
+        "Next: %s. Pool size: %d.",
+        settings.send_window_start_hour, settings.send_window_end_hour,
+        settings.timezone, run_at.isoformat(), db.count_content(),
     )
 
     try:

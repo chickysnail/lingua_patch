@@ -21,10 +21,12 @@ class Settings(BaseSettings):
     # OpenAI model used only to extract the vocabulary that differs from the native language.
     openai_model: str = "gpt-4o-mini"
 
-    # Daily delivery schedule.
+    # Daily delivery schedule. The exact moment is randomised each day
+    # (BeReal-style) inside the [send_window_start_hour, send_window_end_hour)
+    # window in the configured timezone.
     timezone: str = "Europe/Kyiv"
-    daily_hour: int = 10
-    daily_minute: int = 0
+    send_window_start_hour: int = 9
+    send_window_end_hour: int = 21
 
     # Default learning setup for new users.
     default_language: str = "ukr"  # target language the user is learning
