@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.env
+bot.db
+media/
+*.ogg
+*.mp3
+README.md
