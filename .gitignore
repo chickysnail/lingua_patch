@@ -1,0 +1,17 @@
+# Secrets / env
+.env
+*.env
+
+# Database & generated media (seeded locally, not committed)
+*.db
+*.db-journal
+media/*.ogg
+media/*.mp3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
