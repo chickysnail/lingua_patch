@@ -192,37 +192,66 @@ def prune_to_keep(language: str, source: str, keep: int) -> list[str]:
         return paths
 
 
-def count_content(language: str | None = None) -> int:
+def count_content(language: str | None = None, source: str | None = None) -> int:
+    clauses, params = [], []
+    if language:
+        clauses.append("language = ?")
+        params.append(language)
+    if source:
+        clauses.append("source = ?")
+        params.append(source)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with _connect() as conn:
-        if language:
-            row = conn.execute("SELECT COUNT(*) AS c FROM content_pool WHERE language = ?", (language,)).fetchone()
-        else:
-            row = conn.execute("SELECT COUNT(*) AS c FROM content_pool").fetchone()
+        row = conn.execute(f"SELECT COUNT(*) AS c FROM content_pool{where}", params).fetchone()
         return int(row["c"])
 
 
-def pick_unsent_content(user_id: int, language: str) -> dict[str, Any] | None:
-    """Return a content row in ``language`` the user has not received yet.
-
-    Falls back to the least-recently / least-used item once the user has seen
-    everything, so the bot keeps working past the end of the pool.
-    """
+def count_unsent(user_id: int, language: str, source: str | None = None) -> int:
+    """How many items in ``language`` (optionally of ``source``) the user has not yet seen."""
+    clauses = ["language = ?", "id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)"]
+    params: list[Any] = [language, user_id]
+    if source:
+        clauses.append("source = ?")
+        params.append(source)
     with _connect() as conn:
         row = conn.execute(
-            """
+            f"SELECT COUNT(*) AS c FROM content_pool WHERE {' AND '.join(clauses)}", params
+        ).fetchone()
+        return int(row["c"])
+
+
+def pick_unsent_content(user_id: int, language: str, source: str | None = None) -> dict[str, Any] | None:
+    """Return a content row in ``language`` the user has not received yet.
+
+    When ``source`` is given, only items from that audio source are considered.
+    Falls back to the least-used matching item once the user has seen everything,
+    so the bot keeps working past the end of the pool.
+    """
+    src_clause = " AND source = ?" if source else ""
+    with _connect() as conn:
+        params: list[Any] = [language, user_id]
+        if source:
+            params.append(source)
+        row = conn.execute(
+            f"""
             SELECT * FROM content_pool
             WHERE language = ?
               AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)
+              {src_clause}
             ORDER BY used_count ASC, RANDOM()
             LIMIT 1
             """,
-            (language, user_id),
+            params,
         ).fetchone()
         if row is None:
-            # Everything seen: recycle the least-used item.
+            # Everything seen: recycle the least-used matching item.
+            recycle_params: list[Any] = [language]
+            if source:
+                recycle_params.append(source)
             row = conn.execute(
-                "SELECT * FROM content_pool WHERE language = ? ORDER BY used_count ASC, RANDOM() LIMIT 1",
-                (language,),
+                f"SELECT * FROM content_pool WHERE language = ?{src_clause} "
+                "ORDER BY used_count ASC, RANDOM() LIMIT 1",
+                recycle_params,
             ).fetchone()
         return dict(row) if row else None
 
