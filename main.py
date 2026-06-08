@@ -19,11 +19,15 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -143,6 +147,37 @@ async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------------- #
+PATCH_NOW_TEXT = "🎧 Патч зараз"
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(settings.admin_id) and user_id == settings.admin_id
+
+
+def _admin_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent reply keyboard giving the admin a one-tap 'send a patch now' button."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=PATCH_NOW_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Натисни 🎧 Патч зараз",
+    )
+
+
+async def send_patch_now(message: Message, bot: Bot) -> None:
+    """Shared handler for the admin /test_send command and the 🎧 button."""
+    if not _is_admin(message.from_user.id):
+        await message.answer("⛔ Ця команда лише для адміністратора.")
+        return
+    db.upsert_user(message.from_user.id)
+    delivered = await deliver(bot, db.get_user(message.from_user.id))
+    if not delivered:
+        await message.answer(
+            "Не вдалося надіслати патч — у пулі немає контенту для цієї мови. "
+            "Запусти <code>python generate_content.py --language &lt;код&gt;</code>."
+        )
+
+
 def _language_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(text=f"{lang.flag} {lang.name}", callback_data=f"setlang:{code}")
@@ -165,6 +200,7 @@ async def cmd_start(message: Message) -> None:
         "Команди:\n"
         "• /language — змінити мову\n"
         "• раз на день у випадковий час (як BeReal) прийде новий патч 🎧",
+        reply_markup=_admin_keyboard() if _is_admin(message.from_user.id) else None,
     )
 
 
@@ -199,15 +235,25 @@ async def on_set_language(callback: CallbackQuery) -> None:
 
 @router.message(Command("test_send"))
 async def cmd_test_send(message: Message, bot: Bot) -> None:
-    if settings.admin_id and message.from_user.id != settings.admin_id:
-        await message.answer("⛔ Ця команда лише для адміністратора.")
-        return
-    db.upsert_user(message.from_user.id)
-    delivered = await deliver(bot, db.get_user(message.from_user.id))
-    if not delivered:
-        await message.answer(
-            "Не вдалося надіслати патч — у пулі немає контенту для цієї мови. "
-            "Запусти <code>python generate_content.py --language &lt;код&gt;</code>."
+    await send_patch_now(message, bot)
+
+
+@router.message(F.text == PATCH_NOW_TEXT)
+async def on_patch_now_button(message: Message, bot: Bot) -> None:
+    await send_patch_now(message, bot)
+
+
+async def setup_commands(bot: Bot) -> None:
+    """Populate the Telegram command menu (and add /test_send only for the admin)."""
+    base = [
+        BotCommand(command="start", description="Почати / показати поточну мову"),
+        BotCommand(command="language", description="Змінити мову, яку вчиш"),
+    ]
+    await bot.set_my_commands(base)
+    if settings.admin_id:
+        await bot.set_my_commands(
+            base + [BotCommand(command="test_send", description="Надіслати патч зараз (адмін)")],
+            scope=BotCommandScopeChat(chat_id=settings.admin_id),
         )
 
 
@@ -222,6 +268,7 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+    await setup_commands(bot)
 
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
     scheduler.start()
