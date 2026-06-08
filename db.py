@@ -75,6 +75,14 @@ def init_db(db_path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
         )
+        # Migration: add the 'length' dimension ('short' | 'long'). Existing rows
+        # are backfilled from their source (native Tatoeba clips are short; the
+        # original ElevenLabs snippets were the 2-4 sentence 'long' style).
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(content_pool)")}
+        if "length" not in cols:
+            conn.execute("ALTER TABLE content_pool ADD COLUMN length TEXT NOT NULL DEFAULT 'short'")
+            conn.execute("UPDATE content_pool SET length = 'long' WHERE source = 'elevenlabs'")
+            conn.execute("UPDATE content_pool SET length = 'short' WHERE source = 'tatoeba'")
 
 
 def _now() -> str:
@@ -140,13 +148,14 @@ def insert_content(
     vocabulary: list[dict[str, str]],
     source: str = "tatoeba",
     attribution: str | None = None,
+    length: str = "short",
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO content_pool "
             "(language, native_language, tatoeba_id, audio_path, transcript, translation, "
-            " vocabulary_json, source, attribution, used_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            " vocabulary_json, source, attribution, length, used_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 language,
                 native_language,
@@ -157,6 +166,7 @@ def insert_content(
                 json.dumps(vocabulary, ensure_ascii=False),
                 source,
                 attribution,
+                length,
                 _now(),
             ),
         )
@@ -192,7 +202,8 @@ def prune_to_keep(language: str, source: str, keep: int) -> list[str]:
         return paths
 
 
-def count_content(language: str | None = None, source: str | None = None) -> int:
+def count_content(language: str | None = None, source: str | None = None,
+                   length: str | None = None) -> int:
     clauses, params = [], []
     if language:
         clauses.append("language = ?")
@@ -200,19 +211,22 @@ def count_content(language: str | None = None, source: str | None = None) -> int
     if source:
         clauses.append("source = ?")
         params.append(source)
+    if length:
+        clauses.append("length = ?")
+        params.append(length)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with _connect() as conn:
         row = conn.execute(f"SELECT COUNT(*) AS c FROM content_pool{where}", params).fetchone()
         return int(row["c"])
 
 
-def count_unsent(user_id: int, language: str, source: str | None = None) -> int:
-    """How many items in ``language`` (optionally of ``source``) the user has not yet seen."""
+def count_unsent(user_id: int, language: str, length: str | None = None) -> int:
+    """How many items in ``language`` (optionally of a given ``length``) the user has not seen."""
     clauses = ["language = ?", "id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)"]
     params: list[Any] = [language, user_id]
-    if source:
-        clauses.append("source = ?")
-        params.append(source)
+    if length:
+        clauses.append("length = ?")
+        params.append(length)
     with _connect() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) AS c FROM content_pool WHERE {' AND '.join(clauses)}", params
@@ -220,24 +234,25 @@ def count_unsent(user_id: int, language: str, source: str | None = None) -> int:
         return int(row["c"])
 
 
-def pick_unsent_content(user_id: int, language: str, source: str | None = None) -> dict[str, Any] | None:
+def pick_unsent_content(user_id: int, language: str, length: str | None = None) -> dict[str, Any] | None:
     """Return a content row in ``language`` the user has not received yet.
 
-    When ``source`` is given, only items from that audio source are considered.
+    When ``length`` is given, only items of that length are considered (each
+    length pool mixes native + AI items, so the audio source varies per pick).
     Falls back to the least-used matching item once the user has seen everything,
     so the bot keeps working past the end of the pool.
     """
-    src_clause = " AND source = ?" if source else ""
+    len_clause = " AND length = ?" if length else ""
     with _connect() as conn:
         params: list[Any] = [language, user_id]
-        if source:
-            params.append(source)
+        if length:
+            params.append(length)
         row = conn.execute(
             f"""
             SELECT * FROM content_pool
             WHERE language = ?
               AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)
-              {src_clause}
+              {len_clause}
             ORDER BY used_count ASC, RANDOM()
             LIMIT 1
             """,
@@ -246,10 +261,10 @@ def pick_unsent_content(user_id: int, language: str, source: str | None = None) 
         if row is None:
             # Everything seen: recycle the least-used matching item.
             recycle_params: list[Any] = [language]
-            if source:
-                recycle_params.append(source)
+            if length:
+                recycle_params.append(length)
             row = conn.execute(
-                f"SELECT * FROM content_pool WHERE language = ?{src_clause} "
+                f"SELECT * FROM content_pool WHERE language = ?{len_clause} "
                 "ORDER BY used_count ASC, RANDOM() LIMIT 1",
                 recycle_params,
             ).fetchone()

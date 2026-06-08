@@ -17,7 +17,7 @@ from urllib.parse import quote
 import httpx
 
 from config import settings
-from languages import LANGUAGES, NATIVE_NAMES
+from languages import ENGLISH_NAMES, LANGUAGES, NATIVE_NAMES
 
 log = logging.getLogger(__name__)
 
@@ -162,18 +162,26 @@ THEMES = [
     "running late", "a quiet evening at home", "planning a trip",
 ]
 
-_SNIPPET_SYSTEM = (
-    "You write tiny, natural audio snippets for passive language learning. Given a "
-    "target language, the learner's native language, and a theme, produce 2-4 short, "
-    "natural sentences (about 12-20 seconds when read aloud) in the TARGET language on "
-    "that theme — conversational, like something a native speaker would actually say, "
-    "not a textbook example. Then provide the full translation in the native language, "
-    "and pick the 3-5 words MOST DIFFERENT from the native language (false friends or "
-    "words a native speaker would not guess), each with its dictionary form, the "
-    "native-language translation, and a 2-4 word usage hint. Respond ONLY with JSON: "
-    '{"transcript": "...", "translation": "...", '
-    '"vocabulary": [{"word": "...", "translation": "...", "context": "..."}]}'
-)
+
+def _snippet_system(length: str) -> str:
+    if length == "short":
+        span = "ONE short, natural sentence (about 4-8 seconds when read aloud)"
+        words = "2-3"
+    else:
+        span = "2-4 short, natural sentences (about 12-20 seconds when read aloud)"
+        words = "3-5"
+    return (
+        "You write tiny, natural audio snippets for passive language learning. Given a "
+        f"target language, the learner's native language, and a theme, produce {span} in "
+        "the TARGET language on that theme — conversational, like something a native "
+        "speaker would actually say, not a textbook example. Then provide the full "
+        f"translation in the native language, and pick the {words} words MOST DIFFERENT "
+        "from the native language (false friends or words a native speaker would not "
+        "guess), each with its dictionary form, the native-language translation, and a "
+        "2-4 word usage hint. Respond ONLY with JSON: "
+        '{"transcript": "...", "translation": "...", '
+        '"vocabulary": [{"word": "...", "translation": "...", "context": "..."}]}'
+    )
 
 
 def generate_snippet(
@@ -181,11 +189,12 @@ def generate_snippet(
     native_language: str,
     theme: str | None = None,
     client=None,
+    length: str = "long",
 ) -> dict:
-    """Generate a short themed snippet (transcript + translation + vocabulary).
+    """Generate a themed snippet (transcript + translation + vocabulary).
 
-    One OpenAI call produces everything the TTS path needs. Raises on failure so
-    the seeder can skip and try the next one.
+    ``length`` is "short" (one sentence) or "long" (2-4 sentences). One OpenAI call
+    produces everything the TTS path needs. Raises on failure so the seeder can skip.
     """
     if client is None:
         from openai import OpenAI
@@ -193,7 +202,7 @@ def generate_snippet(
         client = OpenAI(api_key=settings.openai_api_key)
 
     theme = theme or random.choice(THEMES)
-    lang_name = LANGUAGES[language].name if language in LANGUAGES else language
+    lang_name = ENGLISH_NAMES.get(language) or (LANGUAGES[language].name if language in LANGUAGES else language)
     native_name = NATIVE_NAMES.get(native_language, native_language)
     user_msg = (
         f"Target language: {lang_name} ({language})\n"
@@ -203,7 +212,7 @@ def generate_snippet(
     resp = client.chat.completions.create(
         model=settings.openai_model,
         messages=[
-            {"role": "system", "content": _SNIPPET_SYSTEM},
+            {"role": "system", "content": _snippet_system(length)},
             {"role": "user", "content": user_msg},
         ],
         response_format={"type": "json_object"},
