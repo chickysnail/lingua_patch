@@ -71,6 +71,11 @@ def init_db(db_path: Path | None = None) -> None:
                 FOREIGN KEY (content_id) REFERENCES content_pool(id)
             );
 
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
@@ -87,6 +92,24 @@ def init_db(db_path: Path | None = None) -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# --------------------------------------------------------------------------- #
+# Meta (small key/value store for bot state, e.g. last daily-send date)
+# --------------------------------------------------------------------------- #
+def get_meta(key: str) -> str | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def set_meta(key: str, value: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
 
 # --------------------------------------------------------------------------- #

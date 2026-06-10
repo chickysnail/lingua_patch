@@ -135,14 +135,15 @@ async def deliver_to_all(bot: Bot) -> int:
 # BeReal-style random daily scheduling
 # --------------------------------------------------------------------------- #
 JOB_ID = "daily_patch"
+LAST_DAILY_KEY = "last_daily_date"
 
 
-def pick_next_run(now: datetime) -> datetime:
+def pick_next_run(now: datetime, *, force_tomorrow: bool = False) -> datetime:
     """Pick the next random delivery time inside the daytime window.
 
-    If today's window has not yet closed, choose a random time later today;
-    otherwise choose a random time tomorrow. A small ``+1`` minute floor avoids
-    scheduling in the past on restarts.
+    Choose a random time in tomorrow's window when ``force_tomorrow`` is set (or
+    today's window has already closed); otherwise choose a random time later
+    today. A small ``+1`` minute floor avoids scheduling in the past on restarts.
     """
     start_h = settings.send_window_start_hour
     end_h = settings.send_window_end_hour
@@ -157,15 +158,22 @@ def pick_next_run(now: datetime) -> datetime:
         return lower + timedelta(seconds=offset)
 
     todays_end = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
-    if now < todays_end:
+    if not force_tomorrow and now < todays_end:
         return random_time_on(now, earliest=now + timedelta(minutes=1))
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
     return random_time_on(tomorrow, earliest=None)
 
 
+def _sent_today(now: datetime) -> bool:
+    """Whether the daily patch already went out on ``now``'s calendar day."""
+    return db.get_meta(LAST_DAILY_KEY) == now.date().isoformat()
+
+
 def schedule_next(scheduler: AsyncIOScheduler, bot: Bot) -> datetime:
     tz = ZoneInfo(settings.timezone)
-    run_at = pick_next_run(datetime.now(tz))
+    now = datetime.now(tz)
+    # Only one patch per day: if today's already gone out, aim for tomorrow.
+    run_at = pick_next_run(now, force_tomorrow=_sent_today(now))
     scheduler.add_job(
         send_and_reschedule,
         trigger=DateTrigger(run_date=run_at),
@@ -178,10 +186,19 @@ def schedule_next(scheduler: AsyncIOScheduler, bot: Bot) -> datetime:
 
 
 async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
+    tz = ZoneInfo(settings.timezone)
+    today = datetime.now(tz).date().isoformat()
     try:
+        # Guard against a double send within the same day (e.g. a restart that
+        # re-armed the job): record the date before delivering so a crash mid-run
+        # still can't trigger a second daily blast.
+        if db.get_meta(LAST_DAILY_KEY) == today:
+            log.info("Daily patch already sent on %s; skipping this run.", today)
+            return
+        db.set_meta(LAST_DAILY_KEY, today)
         await deliver_to_all(bot)
     finally:
-        # Always line up tomorrow's random time, even if today's send failed.
+        # Always line up the next day's random time, even if today's send failed.
         schedule_next(scheduler, bot)
 
 
