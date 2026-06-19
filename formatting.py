@@ -50,6 +50,7 @@ def build_message(content: dict[str, Any]) -> str:
 
     attribution = content.get("attribution")
     if attribution:
-        lines += ["", f"🔊 <i>voice: {escape(attribution)} · AI</i>"]
+        elevenlabs_link = "https://try.elevenlabs.io/m0349ih2iuct"
+        lines += ["", f'🔊 <i>голос: {escape(attribution)} · <a href="{elevenlabs_link}">ElevenLabs</a> (AI)</i>']
 
     return "\n".join(lines)
