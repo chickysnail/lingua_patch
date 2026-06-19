@@ -90,6 +90,8 @@ def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
     """Drop tatoeba_id and length columns from content_pool if present."""
     conn.executescript(
         """
+        PRAGMA foreign_keys = OFF;
+
         DROP TABLE IF EXISTS content_pool_new;
 
         CREATE TABLE content_pool_new (
@@ -117,6 +119,8 @@ def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
         ALTER TABLE content_pool_new RENAME TO content_pool;
 
         CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
+
+        PRAGMA foreign_keys = ON;
         """
     )
 
