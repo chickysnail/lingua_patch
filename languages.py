@@ -1,8 +1,7 @@
 """Supported languages and their display / YouGlish metadata.
 
-Keys are ISO 639-3 codes (matching Tatoeba's ``lang`` parameter). ``youglish``
-is the slug YouGlish uses in its pronounce URLs:
-``https://youglish.com/pronounce/<word>/<youglish-slug>``.
+Keys are ISO 639-3 codes. ``youglish`` is the slug YouGlish uses in its
+pronounce URLs: ``https://youglish.com/pronounce/<word>/<youglish-slug>``.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Language:
-    code: str          # ISO 639-3, used by Tatoeba
+    code: str          # ISO 639-3
     name: str          # human readable, shown to the user
     flag: str          # emoji flag for the message header
     youglish: str      # slug for youglish.com pronounce URLs
