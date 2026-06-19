@@ -16,40 +16,21 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
 
-    # ElevenLabs settings. eleven_multilingual_v2 = best quality (1 credit/char);
-    # eleven_flash_v2_5 = ~half the cost. Leave voice ids empty to use the curated
-    # multilingual pool (a random voice is picked per clip for variety).
+    # ElevenLabs settings. eleven_multilingual_v2 = best quality.
     elevenlabs_model: str = "eleven_multilingual_v2"
     elevenlabs_voice_ids: str = ""
 
-    # On boot, cap how many 'tatoeba'-source items to keep per seeded language
-    # (deleting the excess + their audio). 0 = keep all. Useful when switching the
-    # audio source but wanting to retain a few real native recordings.
-    keep_tatoeba: int = 0
-
-    # Two on-demand patch styles, by LENGTH. "short" = one sentence; "long" = a
-    # 2-4 sentence snippet. Each length pool mixes real native clips (Tatoeba) and
-    # AI-voiced ones (ElevenLabs), so the source is random per pull. The daily
-    # auto-send always uses the long style.
-    daily_length: str = "long"
-    # Fraction of the *short* pool seeded from real native (Tatoeba) audio; the
-    # rest is one-sentence AI snippets. Languages without native audio fall back
-    # to all-AI automatically. (The long pool is AI-only — no native long audio.)
-    short_native_ratio: float = 0.5
-    # When a user's unsent items for a given length fall below this, the bot tops
-    # the pool up in the background so the buttons never go dry.
-    topup_threshold: int = 3
-    topup_count: int = 5
-    # How many items per length to seed the first time a user switches to a
-    # language that has no content yet (kept small so the switch feels instant;
-    # the background top-up grows the pool from there).
-    switch_seed_count: int = 4
-
-    # Admin who may use /test_send (numeric Telegram user id). 0 disables the command.
+    # Admin who receives pool-expansion notifications (numeric Telegram user id).
+    # 0 disables admin messages.
     admin_id: int = 0
 
-    # OpenAI model used only to extract the vocabulary that differs from the native language.
+    # OpenAI model for text generation and vocabulary extraction.
     openai_model: str = "gpt-4o-mini"
+
+    # Pool auto-expansion: when a user has <= topup_threshold unseen patches for
+    # their language, a background job generates topup_count new items.
+    topup_threshold: int = 5
+    topup_count: int = 10
 
     # Daily delivery schedule. The exact moment is randomised each day
     # (BeReal-style) inside the [send_window_start_hour, send_window_end_hour)
@@ -68,7 +49,7 @@ class Settings(BaseSettings):
 
     # Optional auto-seed on startup: comma-separated target codes (e.g. "ukr,spa").
     # On boot, any listed language whose pool has fewer than seed_count items is
-    # topped up from Tatoeba. Leave empty to disable (seed manually instead).
+    # topped up via AI generation. Leave empty to disable.
     seed_on_start: str = ""
     seed_count: int = 10
 

@@ -51,12 +51,11 @@ def init_db(db_path: Path | None = None) -> None:
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 language        TEXT    NOT NULL,
                 native_language TEXT    NOT NULL,
-                tatoeba_id      INTEGER UNIQUE,
                 audio_path      TEXT    NOT NULL,
                 transcript      TEXT    NOT NULL,
                 translation     TEXT,
                 vocabulary_json TEXT    NOT NULL DEFAULT '[]',
-                source          TEXT    NOT NULL DEFAULT 'tatoeba',
+                source          TEXT    NOT NULL DEFAULT 'elevenlabs',
                 attribution     TEXT,
                 used_count      INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT    NOT NULL
@@ -80,14 +79,44 @@ def init_db(db_path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
         )
-        # Migration: add the 'length' dimension ('short' | 'long'). Existing rows
-        # are backfilled from their source (native Tatoeba clips are short; the
-        # original ElevenLabs snippets were the 2-4 sentence 'long' style).
+        # Migration: drop legacy columns that may exist from earlier versions.
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(content_pool)")}
-        if "length" not in cols:
-            conn.execute("ALTER TABLE content_pool ADD COLUMN length TEXT NOT NULL DEFAULT 'short'")
-            conn.execute("UPDATE content_pool SET length = 'long' WHERE source = 'elevenlabs'")
-            conn.execute("UPDATE content_pool SET length = 'short' WHERE source = 'tatoeba'")
+        if "tatoeba_id" in cols:
+            # SQLite doesn't support DROP COLUMN before 3.35; recreate the table.
+            _migrate_drop_legacy_columns(conn)
+
+
+def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
+    """Drop tatoeba_id and length columns from content_pool if present."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS content_pool_new (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            language        TEXT    NOT NULL,
+            native_language TEXT    NOT NULL,
+            audio_path      TEXT    NOT NULL,
+            transcript      TEXT    NOT NULL,
+            translation     TEXT,
+            vocabulary_json TEXT    NOT NULL DEFAULT '[]',
+            source          TEXT    NOT NULL DEFAULT 'elevenlabs',
+            attribution     TEXT,
+            used_count      INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT    NOT NULL
+        );
+
+        INSERT INTO content_pool_new
+            (id, language, native_language, audio_path, transcript, translation,
+             vocabulary_json, source, attribution, used_count, created_at)
+        SELECT id, language, native_language, audio_path, transcript, translation,
+               vocabulary_json, source, attribution, used_count, created_at
+        FROM content_pool;
+
+        DROP TABLE content_pool;
+        ALTER TABLE content_pool_new RENAME TO content_pool;
+
+        CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
+        """
+    )
 
 
 def _now() -> str:
@@ -154,143 +183,79 @@ def get_active_users() -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Content
 # --------------------------------------------------------------------------- #
-def content_exists(tatoeba_id: int) -> bool:
-    with _connect() as conn:
-        row = conn.execute("SELECT 1 FROM content_pool WHERE tatoeba_id = ?", (tatoeba_id,)).fetchone()
-        return row is not None
-
-
 def insert_content(
     *,
     language: str,
     native_language: str,
-    tatoeba_id: int | None,
     audio_path: str,
     transcript: str,
     translation: str | None,
     vocabulary: list[dict[str, str]],
-    source: str = "tatoeba",
+    source: str = "elevenlabs",
     attribution: str | None = None,
-    length: str = "short",
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO content_pool "
-            "(language, native_language, tatoeba_id, audio_path, transcript, translation, "
-            " vocabulary_json, source, attribution, length, used_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            "(language, native_language, audio_path, transcript, translation, "
+            " vocabulary_json, source, attribution, used_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 language,
                 native_language,
-                tatoeba_id,
                 audio_path,
                 transcript,
                 translation,
                 json.dumps(vocabulary, ensure_ascii=False),
                 source,
                 attribution,
-                length,
                 _now(),
             ),
         )
         return int(cur.lastrowid)
 
 
-def prune_to_keep(language: str, source: str, keep: int) -> list[str]:
-    """Keep at most ``keep`` items of ``source`` for ``language``; delete the rest.
-
-    Returns the audio paths of deleted rows so the caller can unlink the files.
-    Least-used items are kept. Any sent_history rows for deleted content are
-    removed first to satisfy the foreign key.
-    """
-    if keep < 0:
-        return []
-    with _connect() as conn:
-        ids = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id FROM content_pool WHERE language = ? AND source = ? "
-                "ORDER BY used_count ASC, id ASC",
-                (language, source),
-            ).fetchall()
-        ]
-        to_delete = ids[keep:]
-        paths: list[str] = []
-        for cid in to_delete:
-            row = conn.execute("SELECT audio_path FROM content_pool WHERE id = ?", (cid,)).fetchone()
-            if row and row["audio_path"]:
-                paths.append(row["audio_path"])
-            conn.execute("DELETE FROM sent_history WHERE content_id = ?", (cid,))
-            conn.execute("DELETE FROM content_pool WHERE id = ?", (cid,))
-        return paths
-
-
-def count_content(language: str | None = None, source: str | None = None,
-                   length: str | None = None) -> int:
-    clauses, params = [], []
+def count_content(language: str | None = None) -> int:
     if language:
-        clauses.append("language = ?")
-        params.append(language)
-    if source:
-        clauses.append("source = ?")
-        params.append(source)
-    if length:
-        clauses.append("length = ?")
-        params.append(length)
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        q = "SELECT COUNT(*) AS c FROM content_pool WHERE language = ?"
+        params: list[str] = [language]
+    else:
+        q = "SELECT COUNT(*) AS c FROM content_pool"
+        params = []
     with _connect() as conn:
-        row = conn.execute(f"SELECT COUNT(*) AS c FROM content_pool{where}", params).fetchone()
+        row = conn.execute(q, params).fetchone()
         return int(row["c"])
 
 
-def count_unsent(user_id: int, language: str, length: str | None = None) -> int:
-    """How many items in ``language`` (optionally of a given ``length``) the user has not seen."""
-    clauses = ["language = ?", "id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)"]
-    params: list[Any] = [language, user_id]
-    if length:
-        clauses.append("length = ?")
-        params.append(length)
+def count_unsent(user_id: int, language: str) -> int:
+    """How many items in ``language`` the user has not seen."""
     with _connect() as conn:
         row = conn.execute(
-            f"SELECT COUNT(*) AS c FROM content_pool WHERE {' AND '.join(clauses)}", params
+            "SELECT COUNT(*) AS c FROM content_pool "
+            "WHERE language = ? "
+            "  AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)",
+            (language, user_id),
         ).fetchone()
         return int(row["c"])
 
 
-def pick_unsent_content(user_id: int, language: str, length: str | None = None) -> dict[str, Any] | None:
+def pick_unsent_content(user_id: int, language: str) -> dict[str, Any] | None:
     """Return a content row in ``language`` the user has not received yet.
 
-    When ``length`` is given, only items of that length are considered (each
-    length pool mixes native + AI items, so the audio source varies per pick).
-    Falls back to the least-used matching item once the user has seen everything,
-    so the bot keeps working past the end of the pool.
+    Returns None when every item has been seen — the caller is expected to
+    trigger pool expansion rather than recycling old content.
     """
-    len_clause = " AND length = ?" if length else ""
     with _connect() as conn:
-        params: list[Any] = [language, user_id]
-        if length:
-            params.append(length)
         row = conn.execute(
-            f"""
+            """
             SELECT * FROM content_pool
             WHERE language = ?
               AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)
-              {len_clause}
-            ORDER BY used_count ASC, RANDOM()
+            ORDER BY RANDOM()
             LIMIT 1
             """,
-            params,
+            (language, user_id),
         ).fetchone()
-        if row is None:
-            # Everything seen: recycle the least-used matching item.
-            recycle_params: list[Any] = [language]
-            if length:
-                recycle_params.append(length)
-            row = conn.execute(
-                f"SELECT * FROM content_pool WHERE language = ?{len_clause} "
-                "ORDER BY used_count ASC, RANDOM() LIMIT 1",
-                recycle_params,
-            ).fetchone()
         return dict(row) if row else None
 
 

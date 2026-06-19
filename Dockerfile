@@ -1,7 +1,7 @@
 # lingua_patch — Telegram long-polling worker.
 FROM python:3.12-slim
 
-# ffmpeg is required to convert Tatoeba mp3 audio into Telegram OGG/Opus voice notes.
+# ffmpeg is required to convert mp3 audio into Telegram OGG/Opus voice notes.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
