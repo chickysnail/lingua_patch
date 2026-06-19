@@ -79,15 +79,15 @@ def init_db(db_path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
         )
-        # Migration: drop legacy columns that may exist from earlier versions.
+        # Migration: drop legacy columns from earlier versions (e.g. tatoeba_id).
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(content_pool)")}
-        if "tatoeba_id" in cols:
+        if "tatoeba_id" in cols or "length" in cols:
             # SQLite doesn't support DROP COLUMN before 3.35; recreate the table.
             _migrate_drop_legacy_columns(conn)
 
 
 def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
-    """Drop tatoeba_id and length columns from content_pool if present."""
+    """Drop legacy columns (tatoeba_id, length) from content_pool if present."""
     conn.executescript(
         """
         PRAGMA foreign_keys = OFF;
