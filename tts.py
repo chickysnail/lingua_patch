@@ -33,21 +33,38 @@ CURATED_VOICES: list[tuple[str, str]] = [
     ("Domi", "AZnzlk1XvdvUeBnXmlld"),
 ]
 
+# Native-speaker voices from the ElevenLabs Voice Library, keyed by ISO 639-3.
+# Preferred over CURATED_VOICES when generating content for a matching language.
+NATIVE_VOICES: dict[str, list[tuple[str, str]]] = {
+    "ukr": [
+        ("Sofiia", "96XEXOjZRHooATdYA8FY"),
+        ("Vira", "nCqaTnIbLdME87OuQaZY"),
+        ("Yaroslava", "0ZQZuw8Sn4cU0rN1Tm2K"),
+        ("Solomiya", "yMBZR4SLoc24wOJLWAB2"),
+        ("Bogdan", "jn6ifzU1eO5tfUZ2ZJVg"),
+        ("Artem", "h9NSQvWZaC4NFusYsxT9"),
+        ("Anton", "GVRiwBELe0czFUAJj0nX"),
+        ("Yevhen", "TEyBWD5tAHAWqAGEv6yI"),
+    ],
+}
+
 
 class ElevenLabsError(RuntimeError):
     pass
 
 
-def _voice_pool() -> list[tuple[str, str]]:
+def _voice_pool(language: str = "") -> list[tuple[str, str]]:
     ids = [v.strip() for v in settings.elevenlabs_voice_ids.split(",") if v.strip()]
     if ids:
         return [(vid, vid) for vid in ids]
+    if language and language in NATIVE_VOICES:
+        return NATIVE_VOICES[language]
     return CURATED_VOICES
 
 
-def pick_voice() -> tuple[str, str]:
+def pick_voice(language: str = "") -> tuple[str, str]:
     """Return a random ``(name, voice_id)`` for this clip."""
-    return random.choice(_voice_pool())
+    return random.choice(_voice_pool(language))
 
 
 def synthesize(text: str, language: str, dest_mp3: Path, *, voice_id: str) -> Path:

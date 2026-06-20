@@ -50,7 +50,7 @@ def seed(language: str, native: str, count: int) -> int:
             log.warning("Snippet generation failed: %s", exc)
             continue
 
-        voice_name, voice_id = tts.pick_voice()
+        voice_name, voice_id = tts.pick_voice(language)
         stamp = int(time.time() * 1000)
         mp3_path = settings.media_dir / f"{language}_tts_{stamp}.mp3"
         ogg_path = settings.media_dir / f"{language}_tts_{stamp}.ogg"
