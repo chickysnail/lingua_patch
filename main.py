@@ -38,6 +38,7 @@ import db
 from config import settings
 from formatting import build_message
 from languages import LANGUAGES, get, is_supported
+from tts import NoNativeVoiceError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("lingua_patch")
@@ -51,7 +52,9 @@ router = Router()
 _expanding: set[str] = set()  # per-language lock
 
 
-async def _expand_pool(bot: Bot, language: str, native: str, count: int) -> int:
+async def _expand_pool(
+    bot: Bot, language: str, native: str, count: int, *, user_id: int = 0,
+) -> int:
     """Generate ``count`` new patches for ``language`` in the background.
 
     De-duped per language so concurrent triggers don't fire duplicate jobs.
@@ -74,6 +77,29 @@ async def _expand_pool(bot: Bot, language: str, native: str, count: int) -> int:
             except Exception:  # noqa: BLE001
                 log.warning("Failed to notify admin about pool expansion.")
         return added
+    except NoNativeVoiceError:
+        lang_label = LANGUAGES[language].name if language in LANGUAGES else language
+        log.warning("No native voices for %s — notifying user and admin.", language)
+        if user_id:
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"⚠️ Sorry, native-speaker voices for <b>{lang_label}</b> "
+                    "are not available yet. We'll notify you when they are added!",
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("Failed to notify user %d about missing voices.", user_id)
+        if settings.admin_id:
+            try:
+                await bot.send_message(
+                    settings.admin_id,
+                    f"🔇 No native voices for <code>{language}</code> ({lang_label}). "
+                    f"Requested by user <code>{user_id}</code>. "
+                    "Please add voices to <code>NATIVE_VOICES</code> in tts.py.",
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("Failed to notify admin about missing voices for %s.", language)
+        return 0
     except Exception as exc:  # noqa: BLE001
         log.warning("Pool expansion failed for %s: %s", language, exc)
         return 0
@@ -85,7 +111,9 @@ def _maybe_expand(bot: Bot, user_id: int, language: str, native: str) -> None:
     """Trigger background pool expansion if the user is running low on unseen patches."""
     unseen = db.count_unsent(user_id, language)
     if unseen <= settings.topup_threshold:
-        asyncio.create_task(_expand_pool(bot, language, native, settings.topup_count))
+        asyncio.create_task(
+            _expand_pool(bot, language, native, settings.topup_count, user_id=user_id),
+        )
 
 
 # --------------------------------------------------------------------------- #
