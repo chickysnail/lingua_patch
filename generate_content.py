@@ -21,6 +21,7 @@ import db
 import tts
 from config import settings
 from languages import is_supported
+from tts import NoNativeVoiceError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("seed")
@@ -37,6 +38,11 @@ def seed(language: str, native: str, count: int) -> int:
         raise RuntimeError("OPENAI_API_KEY is required to generate snippet text.")
     if not settings.elevenlabs_api_key:
         raise RuntimeError("ELEVENLABS_API_KEY is required for AI-voiced patches.")
+
+    if not tts.has_native_voices(language):
+        raise NoNativeVoiceError(
+            f"No native-speaker voices for '{language}'. Cannot generate content."
+        )
 
     openai_client = OpenAI(api_key=settings.openai_api_key)
 
