@@ -21,17 +21,31 @@ LANGUAGES: dict[str, Language] = {
     "ukr": Language("ukr", "Українська", "🇺🇦", "ukrainian"),
     "bul": Language("bul", "Български", "🇧🇬", "bulgarian"),
     "slk": Language("slk", "Slovenčina", "🇸🇰", "slovak"),
+    "pol": Language("pol", "Polski", "🇵🇱", "polish"),
+    "ces": Language("ces", "Čeština", "🇨🇿", "czech"),
     # Wider set.
     "eng": Language("eng", "English", "🇬🇧", "english"),
     "deu": Language("deu", "Deutsch", "🇩🇪", "german"),
+    "fra": Language("fra", "Français", "🇫🇷", "french"),
+    "spa": Language("spa", "Español", "🇪🇸", "spanish"),
+    "ita": Language("ita", "Italiano", "🇮🇹", "italian"),
     "por": Language("por", "Português (Brasil)", "🇧🇷", "portuguese"),
+    "tur": Language("tur", "Türkçe", "🇹🇷", "turkish"),
+    # East Asian.
+    "jpn": Language("jpn", "日本語", "🇯🇵", "japanese"),
+    "kor": Language("kor", "한국어", "🇰🇷", "korean"),
+    "zho": Language("zho", "中文", "🇨🇳", "chinese"),
 }
 
 # English names used in OpenAI prompts (clearer for the model than native script).
 ENGLISH_NAMES = {
     "ukr": "Ukrainian", "bul": "Bulgarian", "slk": "Slovak",
-    "eng": "English", "deu": "German",
-    "por": "Brazilian Portuguese", "rus": "Russian",
+    "pol": "Polish", "ces": "Czech",
+    "eng": "English", "deu": "German", "fra": "French",
+    "spa": "Spanish", "ita": "Italian",
+    "por": "Brazilian Portuguese", "tur": "Turkish",
+    "jpn": "Japanese", "kor": "Korean", "zho": "Mandarin Chinese",
+    "rus": "Russian",
 }
 
 # Native languages we know how to talk about (used for prompts / labels).
@@ -45,7 +59,10 @@ NATIVE_NAMES = {
 # spoken language (multilingual_v2 auto-detects, so this is best-effort).
 ISO_639_1 = {
     "ukr": "uk", "rus": "ru", "bul": "bg", "slk": "sk",
-    "eng": "en", "deu": "de", "por": "pt",
+    "pol": "pl", "ces": "cs",
+    "eng": "en", "deu": "de", "fra": "fr",
+    "spa": "es", "ita": "it", "por": "pt", "tur": "tr",
+    "jpn": "ja", "kor": "ko", "zho": "zh",
 }
 
 
