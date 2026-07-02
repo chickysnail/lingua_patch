@@ -257,15 +257,15 @@ async def send_patch_now(message: Message, bot: Bot) -> None:
     if not delivered:
         _maybe_expand(bot, message.from_user.id, user["language"], native)
         await message.answer(
-            "Готую нові патчі для цієї мови — спробуй ще раз за хвилину 🙏"
+            "Готовлю новые патчи для этого языка — попробуй ещё раз через минуту 🙏"
         )
 
 
 def _switch_message(code: str) -> str:
     lang = get(code)
-    base = f"Готово! Тепер ти вчиш: {lang.flag} <b>{lang.name}</b>."
+    base = f"Готово! Теперь ты учишь: {lang.flag} <b>{lang.name}</b>."
     if db.count_content(code) == 0:
-        base += "\n\nГотую перші патчі для цієї мови — це займе до хвилини. Потім тисни GET MORE."
+        base += "\n\nГотовлю первые патчи для этого языка — это займёт до минуты. Потом жми GET MORE."
     return base
 
 
@@ -287,14 +287,14 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     native = user.get("native_language", settings.native_language)
     _maybe_expand(bot, message.from_user.id, user["language"], native)
     await message.answer(
-        "👋 Привіт! Я надсилатиму тобі <b>один аудіо-патч на день</b> — "
-        "текст, переклад і кілька слів, що найбільше відрізняються від рідної "
-        f"мови.\n\nЗараз ти вчиш: <b>{current}</b>.\n\n"
-        "Кнопка <b>GET MORE</b> — отримай патч прямо зараз\n\n"
-        "Команди:\n"
+        "👋 Привет! Я буду присылать тебе <b>один аудио-патч в день</b> — "
+        "текст, перевод и несколько слов, которые больше всего отличаются от родного "
+        f"языка.\n\nСейчас ты учишь: <b>{current}</b>.\n\n"
+        "Кнопка <b>GET MORE</b> — получи патч прямо сейчас\n\n"
+        "Команды:\n"
         "• /patch — хочу патч 🎧\n"
-        "• /language — змінити мову\n"
-        "• раз на день у випадковий час (як BeReal) сам прийде новий патч",
+        "• /language — сменить язык\n"
+        "• раз в день в случайное время (как BeReal) сам придёт новый патч",
         reply_markup=_patch_keyboard(),
     )
 
@@ -306,20 +306,20 @@ async def cmd_language(message: Message, command: CommandObject, bot: Bot) -> No
     if arg:
         if not is_supported(arg):
             supported = ", ".join(LANGUAGES.keys())
-            await message.answer(f"Не знаю мову <code>{arg}</code>. Доступні: {supported}")
+            await message.answer(f"Не знаю язык <code>{arg}</code>. Доступные: {supported}")
             return
         db.set_user_language(message.from_user.id, arg)
         await message.answer(_switch_message(arg))
         _maybe_expand(bot, message.from_user.id, arg, settings.native_language)
         return
-    await message.answer("Обери мову, яку хочеш вчити:", reply_markup=_language_keyboard())
+    await message.answer("Выбери язык, который хочешь учить:", reply_markup=_language_keyboard())
 
 
 @router.callback_query(F.data.startswith("setlang:"))
 async def on_set_language(callback: CallbackQuery, bot: Bot) -> None:
     code = callback.data.split(":", 1)[1]
     if not is_supported(code):
-        await callback.answer("Невідома мова", show_alert=True)
+        await callback.answer("Неизвестный язык", show_alert=True)
         return
     db.upsert_user(callback.from_user.id)
     db.set_user_language(callback.from_user.id, code)
@@ -343,8 +343,8 @@ async def setup_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="patch", description="Хочу патч 🎧"),
-            BotCommand(command="language", description="Змінити мову, яку вчиш"),
-            BotCommand(command="start", description="Почати / показати поточну мову"),
+            BotCommand(command="language", description="Сменить изучаемый язык"),
+            BotCommand(command="start", description="Начать / показать текущий язык"),
         ]
     )
 
