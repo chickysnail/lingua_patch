@@ -21,19 +21,17 @@ LANGUAGES: dict[str, Language] = {
     "ukr": Language("ukr", "Українська", "🇺🇦", "ukrainian"),
     "bul": Language("bul", "Български", "🇧🇬", "bulgarian"),
     "slk": Language("slk", "Slovenčina", "🇸🇰", "slovak"),
-    "cnr": Language("cnr", "Crnogorski", "🇲🇪", "serbian"),
     # Wider set.
     "eng": Language("eng", "English", "🇬🇧", "english"),
     "deu": Language("deu", "Deutsch", "🇩🇪", "german"),
     "por": Language("por", "Português (Brasil)", "🇧🇷", "portuguese"),
-    "kaz": Language("kaz", "Қазақша", "🇰🇿", "kazakh"),
 }
 
 # English names used in OpenAI prompts (clearer for the model than native script).
 ENGLISH_NAMES = {
     "ukr": "Ukrainian", "bul": "Bulgarian", "slk": "Slovak",
-    "cnr": "Montenegrin", "eng": "English", "deu": "German",
-    "por": "Brazilian Portuguese", "kaz": "Kazakh", "rus": "Russian",
+    "eng": "English", "deu": "German",
+    "por": "Brazilian Portuguese", "rus": "Russian",
 }
 
 # Native languages we know how to talk about (used for prompts / labels).
@@ -45,11 +43,9 @@ NATIVE_NAMES = {
 
 # ISO 639-3 -> ISO 639-1, the code ElevenLabs flash/turbo models accept to pin the
 # spoken language (multilingual_v2 auto-detects, so this is best-effort).
-# Montenegrin has no 639-1 code; it is part of the Serbo-Croatian continuum, so we
-# fall back to Serbian ("sr") for pronunciation pinning / YouGlish.
 ISO_639_1 = {
-    "ukr": "uk", "rus": "ru", "bul": "bg", "slk": "sk", "cnr": "sr",
-    "eng": "en", "deu": "de", "por": "pt", "kaz": "kk",
+    "ukr": "uk", "rus": "ru", "bul": "bg", "slk": "sk",
+    "eng": "en", "deu": "de", "por": "pt",
 }
 
 
