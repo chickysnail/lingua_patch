@@ -29,7 +29,7 @@ def build_message(content: dict[str, Any]) -> str:
     name = lang.name if lang else language
 
     transcript = escape(content["transcript"])
-    lines = [f"{flag} <b>Патч дня — {escape(name)}</b> (слухай 🎧)", "", transcript]
+    lines = [f"{flag} <b>Патч дня — {escape(name)}</b> (слушай 🎧)", "", transcript]
 
     translation = content.get("translation")
     if translation:
@@ -37,7 +37,7 @@ def build_message(content: dict[str, Any]) -> str:
 
     vocab = _vocab_list(content)
     if vocab:
-        lines += ["", "💡 <b>Словничок</b>"]
+        lines += ["", "💡 <b>Словарик</b>"]
         for item in vocab:
             word = item.get("word", "").strip()
             if not word:
