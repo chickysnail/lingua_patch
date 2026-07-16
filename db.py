@@ -40,16 +40,11 @@ def init_db(db_path: Path | None = None) -> None:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id            INTEGER PRIMARY KEY,
-                join_date          TEXT    NOT NULL,
-                is_active          INTEGER NOT NULL DEFAULT 1,
-                language           TEXT    NOT NULL,
-                native_language    TEXT    NOT NULL,
-                personal_prompt    TEXT,
-                rules_version      INTEGER NOT NULL DEFAULT 0,
-                pending_prompt     TEXT,
-                send_time          TEXT,
-                awaiting_time      INTEGER NOT NULL DEFAULT 0
+                user_id         INTEGER PRIMARY KEY,
+                join_date       TEXT    NOT NULL,
+                is_active       INTEGER NOT NULL DEFAULT 1,
+                language        TEXT    NOT NULL,
+                native_language TEXT    NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS content_pool (
@@ -63,9 +58,7 @@ def init_db(db_path: Path | None = None) -> None:
                 source          TEXT    NOT NULL DEFAULT 'elevenlabs',
                 attribution     TEXT,
                 used_count      INTEGER NOT NULL DEFAULT 0,
-                created_at      TEXT    NOT NULL,
-                owner_user_id   INTEGER,
-                rules_version   INTEGER
+                created_at      TEXT    NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS sent_history (
@@ -91,39 +84,6 @@ def init_db(db_path: Path | None = None) -> None:
         if "tatoeba_id" in cols or "length" in cols:
             # SQLite doesn't support DROP COLUMN before 3.35; recreate the table.
             _migrate_drop_legacy_columns(conn)
-
-        # Migration: add personalization / scheduling columns to existing DBs.
-        _add_missing_columns(
-            conn,
-            "users",
-            {
-                "personal_prompt": "TEXT",
-                "rules_version": "INTEGER NOT NULL DEFAULT 0",
-                "pending_prompt": "TEXT",
-                "send_time": "TEXT",
-                "awaiting_time": "INTEGER NOT NULL DEFAULT 0",
-            },
-        )
-        _add_missing_columns(
-            conn,
-            "content_pool",
-            {"owner_user_id": "INTEGER", "rules_version": "INTEGER"},
-        )
-        # Created after the migration above so it works on pre-existing DBs whose
-        # content_pool did not yet have the owner_user_id column.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_content_owner ON content_pool(owner_user_id)"
-        )
-
-
-def _add_missing_columns(
-    conn: sqlite3.Connection, table: str, columns: dict[str, str]
-) -> None:
-    """Add any of ``columns`` (name -> SQL type/decl) missing from ``table``."""
-    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-    for name, decl in columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
@@ -227,63 +187,6 @@ def get_active_users() -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# Personalization (per-user prompt rules)
-# --------------------------------------------------------------------------- #
-def set_pending_prompt(user_id: int, prompt: str | None) -> None:
-    """Store a proposed personal prompt awaiting the user's confirmation."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE users SET pending_prompt = ? WHERE user_id = ?", (prompt, user_id)
-        )
-
-
-def confirm_pending_prompt(user_id: int) -> int:
-    """Promote the pending prompt to the active one and bump the rules version.
-
-    Returns the new rules_version. Clears the pending prompt. An empty/blank
-    prompt resets the user back to the shared pool.
-    """
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT pending_prompt, rules_version FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        pending = (row["pending_prompt"] if row else None) or None
-        if pending is not None and not pending.strip():
-            pending = None
-        new_version = int(row["rules_version"] if row else 0) + 1
-        conn.execute(
-            "UPDATE users SET personal_prompt = ?, rules_version = ?, "
-            "pending_prompt = NULL WHERE user_id = ?",
-            (pending, new_version, user_id),
-        )
-        return new_version
-
-
-def set_send_time(user_id: int, send_time: str | None) -> None:
-    """Set a fixed daily delivery time ('HH:MM') or None for a random window."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE users SET send_time = ?, awaiting_time = 0 WHERE user_id = ?",
-            (send_time, user_id),
-        )
-
-
-def set_awaiting_time(user_id: int, awaiting: bool) -> None:
-    """Flag that the next free-text message should be parsed as a custom time."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE users SET awaiting_time = ? WHERE user_id = ?",
-            (1 if awaiting else 0, user_id),
-        )
-
-
-def is_personalized(user: dict[str, Any]) -> bool:
-    """True when the user has an active personal prompt (non-shared pool)."""
-    return bool((user.get("personal_prompt") or "").strip())
-
-
-# --------------------------------------------------------------------------- #
 # Content
 # --------------------------------------------------------------------------- #
 def insert_content(
@@ -296,19 +199,13 @@ def insert_content(
     vocabulary: list[dict[str, str]],
     source: str = "elevenlabs",
     attribution: str | None = None,
-    owner_user_id: int | None = None,
-    rules_version: int | None = None,
 ) -> int:
-    """Insert a patch. ``owner_user_id`` NULL means the shared pool; otherwise it
-    is a personalized patch tagged with the owner's ``rules_version``.
-    """
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO content_pool "
             "(language, native_language, audio_path, transcript, translation, "
-            " vocabulary_json, source, attribution, used_count, created_at, "
-            " owner_user_id, rules_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            " vocabulary_json, source, attribution, used_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 language,
                 native_language,
@@ -319,8 +216,6 @@ def insert_content(
                 source,
                 attribution,
                 _now(),
-                owner_user_id,
-                rules_version,
             ),
         )
         return int(cur.lastrowid)
@@ -338,93 +233,36 @@ def count_content(language: str | None = None) -> int:
         return int(row["c"])
 
 
-def _scope_clause(user_id: int, personal_version: int | None) -> tuple[str, list[Any]]:
-    """Build the WHERE fragment selecting the shared pool vs. a user's buffer.
-
-    ``personal_version is None`` -> shared pool (``owner_user_id IS NULL``);
-    otherwise -> that user's patches at the given rules version.
-    """
-    if personal_version is None:
-        return "AND owner_user_id IS NULL", []
-    return "AND owner_user_id = ? AND rules_version = ?", [user_id, personal_version]
-
-
-def count_unsent(user_id: int, language: str, personal_version: int | None = None) -> int:
-    """How many items in ``language`` the user has not seen, scoped to the
-    shared pool or the user's personalized buffer."""
-    scope, extra = _scope_clause(user_id, personal_version)
+def count_unsent(user_id: int, language: str) -> int:
+    """How many items in ``language`` the user has not seen."""
     with _connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM content_pool "
-            f"WHERE language = ? {scope} "
+            "WHERE language = ? "
             "  AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)",
-            [language, *extra, user_id],
+            (language, user_id),
         ).fetchone()
         return int(row["c"])
 
 
-def pick_unsent_content(
-    user_id: int, language: str, personal_version: int | None = None
-) -> dict[str, Any] | None:
+def pick_unsent_content(user_id: int, language: str) -> dict[str, Any] | None:
     """Return a content row in ``language`` the user has not received yet.
 
-    Scoped to the shared pool (``personal_version is None``) or the user's
-    personalized buffer at ``personal_version``. Returns None when every item
-    has been seen — the caller then triggers generation rather than recycling.
+    Returns None when every item has been seen — the caller is expected to
+    trigger pool expansion rather than recycling old content.
     """
-    scope, extra = _scope_clause(user_id, personal_version)
     with _connect() as conn:
         row = conn.execute(
-            f"""
+            """
             SELECT * FROM content_pool
-            WHERE language = ? {scope}
+            WHERE language = ?
               AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)
             ORDER BY RANDOM()
             LIMIT 1
             """,
-            [language, *extra, user_id],
+            (language, user_id),
         ).fetchone()
         return dict(row) if row else None
-
-
-def discard_unsent_personal(user_id: int) -> list[str]:
-    """Delete the user's unseen personalized patches (e.g. after a rule change).
-
-    Returns the audio paths of the deleted rows so the caller can unlink the
-    files. Rows already delivered are kept for history integrity.
-    """
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, audio_path FROM content_pool "
-            "WHERE owner_user_id = ? "
-            "  AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)",
-            (user_id, user_id),
-        ).fetchall()
-        ids = [r["id"] for r in rows]
-        if ids:
-            placeholders = ",".join("?" * len(ids))
-            conn.execute(f"DELETE FROM content_pool WHERE id IN ({placeholders})", ids)
-        return [r["audio_path"] for r in rows]
-
-
-def get_users_with_fixed_time() -> list[dict[str, Any]]:
-    """Active users who chose a fixed daily delivery time ('HH:MM')."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE is_active = 1 "
-            "AND send_time IS NOT NULL AND send_time != ''"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def get_random_time_users() -> list[dict[str, Any]]:
-    """Active users on the randomized daily window (no fixed time set)."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE is_active = 1 "
-            "AND (send_time IS NULL OR send_time = '')"
-        ).fetchall()
-        return [dict(r) for r in rows]
 
 
 def record_sent(user_id: int, content_id: int) -> None:
