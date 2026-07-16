@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     bot_token: str = ""
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
+    # Separate key for speech-to-text (Scribe), which needs the speech_to_text
+    # permission. Falls back to elevenlabs_api_key when empty.
+    elevenlabs_stt_api_key: str = ""
 
     # ElevenLabs settings. eleven_multilingual_v2 = best quality.
     elevenlabs_model: str = "eleven_multilingual_v2"

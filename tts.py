@@ -201,14 +201,15 @@ def transcribe(audio_path: Path) -> str:
     Language is auto-detected, so a learner can dictate a personalization rule
     in any language. Raises ``ElevenLabsError`` on failure or empty result.
     """
-    if not settings.elevenlabs_api_key:
-        raise ElevenLabsError("ELEVENLABS_API_KEY is not set.")
+    api_key = settings.elevenlabs_stt_api_key or settings.elevenlabs_api_key
+    if not api_key:
+        raise ElevenLabsError("No ElevenLabs API key set for speech-to-text.")
 
     with httpx.Client(timeout=120) as client:
         with open(audio_path, "rb") as f:
             resp = client.post(
                 ELEVENLABS_STT,
-                headers={"xi-api-key": settings.elevenlabs_api_key},
+                headers={"xi-api-key": api_key},
                 data={"model_id": STT_MODEL, "tag_audio_events": "false"},
                 files={"file": (audio_path.name, f, "application/octet-stream")},
             )
