@@ -68,15 +68,69 @@ _SNIPPET_SYSTEM = (
 )
 
 
+_PROFILE_SYSTEM = (
+    "You maintain a compact personalization profile that customizes AI-generated "
+    "language-learning audio snippets for one learner. You receive the learner's "
+    "CURRENT profile (may be empty) and a NEW instruction they just sent (in any "
+    "language, possibly transcribed from voice). Merge them into an updated "
+    "profile: keep still-relevant existing rules, add the new preference, and if "
+    "the new instruction contradicts an existing rule, the NEW one wins. Keep the "
+    "profile as a short list of concrete rules (topics, tone, difficulty, "
+    "grammar/vocabulary focus, length, etc.) — at most ~6 bullet lines, no fluff. "
+    "If the instruction asks to clear/reset preferences, return an empty profile. "
+    "Also write a short, friendly confirmation summary in RUSSIAN describing what "
+    "the snippets will now be like. Respond ONLY with JSON: "
+    '{"profile": "•  ...\\n•  ...", "summary": "..."}'
+)
+
+
+def synthesize_profile(
+    current_profile: str | None,
+    new_instruction: str,
+    client: object | None = None,
+) -> dict:
+    """Merge a new instruction into the learner's personalization profile.
+
+    Returns ``{"profile": str, "summary": str}`` where ``profile`` is the updated
+    rule list (empty string means 'back to the shared pool') and ``summary`` is a
+    Russian confirmation to show the user. Raises on failure.
+    """
+    if client is None:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.openai_api_key)
+
+    user_msg = (
+        f"CURRENT profile:\n{(current_profile or '').strip() or '(empty)'}\n\n"
+        f"NEW instruction:\n{new_instruction.strip()}"
+    )
+    resp = client.chat.completions.create(
+        model=settings.openai_model,
+        messages=[
+            {"role": "system", "content": _PROFILE_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+    payload = json.loads(resp.choices[0].message.content or "{}")
+    profile = str(payload.get("profile", "")).strip()
+    summary = str(payload.get("summary", "")).strip()
+    return {"profile": profile, "summary": summary}
+
+
 def generate_snippet(
     language: str,
     native_language: str,
     theme: str | None = None,
     client: object | None = None,
+    custom_prompt: str | None = None,
 ) -> dict:
     """Generate a themed snippet (transcript + translation + vocabulary).
 
-    One OpenAI call produces everything the TTS path needs.
+    One OpenAI call produces everything the TTS path needs. When
+    ``custom_prompt`` is given (the learner's personalization rules), it is
+    passed to the model so the snippet follows the learner's preferences.
     Raises on failure so the caller can skip and retry.
     """
     if client is None:
@@ -92,6 +146,12 @@ def generate_snippet(
         f"Native language: {native_name} ({native_language})\n"
         f"Theme: {theme}"
     )
+    if custom_prompt and custom_prompt.strip():
+        user_msg += (
+            "\n\nLearner personalization rules (follow them closely; they take "
+            "priority over the theme when they conflict):\n"
+            f"{custom_prompt.strip()}"
+        )
     resp = client.chat.completions.create(
         model=settings.openai_model,
         messages=[
