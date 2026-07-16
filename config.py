@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # Daily delivery schedule. The exact moment is randomised each day
     # (BeReal-style) inside the [send_window_start_hour, send_window_end_hour)
     # window in the configured timezone.
-    timezone: str = "Europe/Kyiv"
+    timezone: str = "Europe/Moscow"
     send_window_start_hour: int = 9
     send_window_end_hour: int = 21
 

@@ -45,7 +45,9 @@ def init_db(db_path: Path | None = None) -> None:
                 is_active       INTEGER NOT NULL DEFAULT 1,
                 language        TEXT    NOT NULL,
                 native_language TEXT    NOT NULL,
-                difficulty      TEXT
+                difficulty      TEXT,
+                send_time       TEXT,
+                awaiting_time   INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS content_pool (
@@ -87,8 +89,16 @@ def init_db(db_path: Path | None = None) -> None:
             # SQLite doesn't support DROP COLUMN before 3.35; recreate the table.
             _migrate_drop_legacy_columns(conn)
 
-        # Migration: add the difficulty columns to pre-existing DBs.
-        _add_missing_columns(conn, "users", {"difficulty": "TEXT"})
+        # Migration: add the difficulty + delivery-time columns to pre-existing DBs.
+        _add_missing_columns(
+            conn,
+            "users",
+            {
+                "difficulty": "TEXT",
+                "send_time": "TEXT",
+                "awaiting_time": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
         _add_missing_columns(conn, "content_pool", {"difficulty": "TEXT"})
         # Created after the migration so it also works on DBs whose content_pool
         # did not yet have the difficulty column.
@@ -201,6 +211,44 @@ def set_user_difficulty(user_id: int, difficulty: str | None) -> None:
         conn.execute(
             "UPDATE users SET difficulty = ? WHERE user_id = ?", (difficulty, user_id)
         )
+
+
+def set_send_time(user_id: int, send_time: str | None) -> None:
+    """Set a fixed daily delivery time ('HH:MM') or None for a random window."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE users SET send_time = ?, awaiting_time = 0 WHERE user_id = ?",
+            (send_time, user_id),
+        )
+
+
+def set_awaiting_time(user_id: int, awaiting: bool) -> None:
+    """Flag that the next free-text message should be parsed as a custom time."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE users SET awaiting_time = ? WHERE user_id = ?",
+            (1 if awaiting else 0, user_id),
+        )
+
+
+def get_users_with_fixed_time() -> list[dict[str, Any]]:
+    """Active users who chose a fixed daily delivery time ('HH:MM')."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE is_active = 1 "
+            "AND send_time IS NOT NULL AND send_time != ''"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_random_time_users() -> list[dict[str, Any]]:
+    """Active users on the randomized daily window (no fixed time set)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE is_active = 1 "
+            "AND (send_time IS NULL OR send_time = '')"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:
