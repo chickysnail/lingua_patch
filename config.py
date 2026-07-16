@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     topup_threshold: int = 5
     topup_count: int = 10
 
+    # Personalized users keep a small per-user buffer instead of the shared pool:
+    # tagged with the user's rules version and regenerated when they change a rule,
+    # so few pre-generated patches are wasted. Kept small because generation is fast
+    # (~5-6s/patch). When a user has <= personal_topup_threshold unseen personalized
+    # patches, personal_topup_count new ones are generated in the background.
+    personal_topup_threshold: int = 1
+    personal_topup_count: int = 3
+
     # Daily delivery schedule. The exact moment is randomised each day
     # (BeReal-style) inside the [send_window_start_hour, send_window_end_hour)
     # window in the configured timezone.

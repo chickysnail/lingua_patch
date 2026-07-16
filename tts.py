@@ -19,6 +19,10 @@ from languages import ISO_639_1
 log = logging.getLogger(__name__)
 
 ELEVENLABS_TTS = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+ELEVENLABS_STT = "https://api.elevenlabs.io/v1/speech-to-text"
+
+# ElevenLabs Scribe model for speech-to-text (same solution used across the bots).
+STT_MODEL = "scribe_v2"
 
 # Native-speaker voices from the ElevenLabs Voice Library, keyed by ISO 639-3.
 # Only languages with a pool here can generate content; missing languages trigger
@@ -189,6 +193,31 @@ def pick_voice(language: str) -> tuple[str, str]:
             "Add entries to NATIVE_VOICES or set ELEVENLABS_VOICE_IDS."
         )
     return random.choice(pool)
+
+
+def transcribe(audio_path: Path) -> str:
+    """Transcribe a voice message to text via ElevenLabs Scribe.
+
+    Language is auto-detected, so a learner can dictate a personalization rule
+    in any language. Raises ``ElevenLabsError`` on failure or empty result.
+    """
+    if not settings.elevenlabs_api_key:
+        raise ElevenLabsError("ELEVENLABS_API_KEY is not set.")
+
+    with httpx.Client(timeout=120) as client:
+        with open(audio_path, "rb") as f:
+            resp = client.post(
+                ELEVENLABS_STT,
+                headers={"xi-api-key": settings.elevenlabs_api_key},
+                data={"model_id": STT_MODEL, "tag_audio_events": "false"},
+                files={"file": (audio_path.name, f, "application/octet-stream")},
+            )
+    if resp.status_code != 200:
+        raise ElevenLabsError(f"STT failed ({resp.status_code}): {resp.text[:200]}")
+    text = str(resp.json().get("text", "")).strip()
+    if not text:
+        raise ElevenLabsError("STT returned empty text")
+    return text
 
 
 def synthesize(text: str, language: str, dest_mp3: Path, *, voice_id: str) -> Path:

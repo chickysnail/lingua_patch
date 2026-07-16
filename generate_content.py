@@ -27,8 +27,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("seed")
 
 
-def seed(language: str, native: str, count: int) -> int:
-    """Generate ``count`` AI-voiced patches for ``language`` and insert them."""
+def seed(
+    language: str,
+    native: str,
+    count: int,
+    *,
+    custom_prompt: str | None = None,
+    owner_user_id: int | None = None,
+    rules_version: int | None = None,
+) -> int:
+    """Generate ``count`` AI-voiced patches for ``language`` and insert them.
+
+    When ``owner_user_id`` is set the patches are personalized (tagged with the
+    owner and ``rules_version``) and generated with ``custom_prompt``; otherwise
+    they go into the shared pool.
+    """
     db.init_db()
 
     if not is_supported(language):
@@ -51,7 +64,9 @@ def seed(language: str, native: str, count: int) -> int:
     while inserted < count and attempts < count * 3:
         attempts += 1
         try:
-            snippet = content_mod.generate_snippet(language, native, client=openai_client)
+            snippet = content_mod.generate_snippet(
+                language, native, client=openai_client, custom_prompt=custom_prompt
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("Snippet generation failed: %s", exc)
             continue
@@ -79,6 +94,8 @@ def seed(language: str, native: str, count: int) -> int:
             vocabulary=snippet["vocabulary"],
             source="elevenlabs",
             attribution=voice_name,
+            owner_user_id=owner_user_id,
+            rules_version=rules_version,
         )
         inserted += 1
         log.info("[%d/%d] seeded id=%d voice=%s theme=%s words=%d: %s",
