@@ -49,30 +49,35 @@ router = Router()
 # --------------------------------------------------------------------------- #
 # Pool expansion (background)
 # --------------------------------------------------------------------------- #
-_expanding: set[str] = set()  # per-language lock
+_expanding: set[str] = set()  # per-(language, difficulty) lock
 
 
 async def _expand_pool(
-    bot: Bot, language: str, native: str, count: int, *, user_id: int = 0,
+    bot: Bot, language: str, native: str, count: int, *,
+    user_id: int = 0, difficulty: str | None = None,
 ) -> int:
-    """Generate ``count`` new patches for ``language`` in the background.
+    """Generate ``count`` new patches for ``language``/``difficulty`` in the background.
 
-    De-duped per language so concurrent triggers don't fire duplicate jobs.
-    Notifies the admin on completion.
+    De-duped per (language, difficulty) so concurrent triggers don't fire
+    duplicate jobs. Notifies the admin on completion.
     """
-    if language in _expanding:
+    key = f"{language}:{difficulty or ''}"
+    if key in _expanding:
         return 0
-    _expanding.add(language)
+    _expanding.add(key)
     try:
         from generate_content import seed
-        added = await asyncio.to_thread(seed, language, native, count)
-        log.info("Pool expanded: +%d items for %s (pool now %d).", added, language, db.count_content(language))
+        added = await asyncio.to_thread(seed, language, native, count, difficulty=difficulty)
+        pool_now = db.count_content(language, difficulty)
+        log.info("Pool expanded: +%d items for %s (tier=%s, pool now %d).",
+                 added, language, difficulty or "default", pool_now)
         if settings.admin_id and added > 0:
             try:
+                tier = f" [{difficulty}]" if difficulty else ""
                 await bot.send_message(
                     settings.admin_id,
-                    f"🔄 Pool expanded: <b>+{added}</b> patches for <code>{language}</code> "
-                    f"(total: {db.count_content(language)})",
+                    f"🔄 Pool expanded: <b>+{added}</b> patches for <code>{language}</code>{tier} "
+                    f"(total: {pool_now})",
                 )
             except Exception:  # noqa: BLE001
                 log.warning("Failed to notify admin about pool expansion.")
@@ -104,15 +109,20 @@ async def _expand_pool(
         log.warning("Pool expansion failed for %s: %s", language, exc)
         return 0
     finally:
-        _expanding.discard(language)
+        _expanding.discard(key)
 
 
-def _maybe_expand(bot: Bot, user_id: int, language: str, native: str) -> None:
+def _maybe_expand(
+    bot: Bot, user_id: int, language: str, native: str, difficulty: str | None = None
+) -> None:
     """Trigger background pool expansion if the user is running low on unseen patches."""
-    unseen = db.count_unsent(user_id, language)
+    unseen = db.count_unsent(user_id, language, difficulty)
     if unseen <= settings.topup_threshold:
         asyncio.create_task(
-            _expand_pool(bot, language, native, settings.topup_count, user_id=user_id),
+            _expand_pool(
+                bot, language, native, settings.topup_count,
+                user_id=user_id, difficulty=difficulty,
+            ),
         )
 
 
@@ -128,10 +138,12 @@ async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
     user_id = user["user_id"]
     language = user["language"]
     native = user.get("native_language", settings.native_language)
+    difficulty = user.get("difficulty")
 
-    content = db.pick_unsent_content(user_id, language)
+    content = db.pick_unsent_content(user_id, language, difficulty)
     if content is None:
-        log.info("No unseen content for user %s (language=%s).", user_id, language)
+        log.info("No unseen content for user %s (language=%s, tier=%s).",
+                 user_id, language, difficulty or "default")
         return False
 
     audio_path = Path(content["audio_path"])
@@ -151,7 +163,7 @@ async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
         return False
 
     db.record_sent(user_id, content["id"])
-    _maybe_expand(bot, user_id, language, native)
+    _maybe_expand(bot, user_id, language, native, difficulty)
     return True
 
 
@@ -237,6 +249,31 @@ async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 PATCH_NOW_TEXT = "GET MORE"
 
+# Difficulty tiers. None (the default) uses the shared unmarked pool.
+DIFFICULTY_LABELS: dict[str, str] = {
+    "easy": "🟢 Простой",
+    "medium": "🟡 Средний",
+    "hard": "🔴 Сложный",
+}
+
+
+def _difficulty_label(difficulty: str | None) -> str:
+    return DIFFICULTY_LABELS.get(difficulty or "", "⚪️ Без уровня (обычный пул)")
+
+
+def _level_keyboard(current: str | None) -> InlineKeyboardMarkup:
+    """Inline keyboard to pick a difficulty tier; marks the active one."""
+    def label(key: str | None, text: str) -> str:
+        return f"✅ {text}" if key == current else text
+
+    rows = [
+        [InlineKeyboardButton(text=label("easy", DIFFICULTY_LABELS["easy"]), callback_data="setlevel:easy")],
+        [InlineKeyboardButton(text=label("medium", DIFFICULTY_LABELS["medium"]), callback_data="setlevel:medium")],
+        [InlineKeyboardButton(text=label("hard", DIFFICULTY_LABELS["hard"]), callback_data="setlevel:hard")],
+        [InlineKeyboardButton(text=label(None, "⚪️ Без уровня"), callback_data="setlevel:none")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def _patch_keyboard() -> ReplyKeyboardMarkup:
     """Persistent reply keyboard with a single 'GET MORE' button."""
@@ -255,7 +292,7 @@ async def send_patch_now(message: Message, bot: Bot) -> None:
     native = user.get("native_language", settings.native_language)
     delivered = await deliver(bot, user)
     if not delivered:
-        _maybe_expand(bot, message.from_user.id, user["language"], native)
+        _maybe_expand(bot, message.from_user.id, user["language"], native, user.get("difficulty"))
         await message.answer(
             "Готовлю новые патчи для этого языка — попробуй ещё раз через минуту 🙏"
         )
@@ -285,7 +322,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     lang = get(user["language"]) if is_supported(user["language"]) else None
     current = f"{lang.flag} {lang.name}" if lang else user["language"]
     native = user.get("native_language", settings.native_language)
-    _maybe_expand(bot, message.from_user.id, user["language"], native)
+    _maybe_expand(bot, message.from_user.id, user["language"], native, user.get("difficulty"))
     await message.answer(
         "👋 Привет! Я буду присылать тебе <b>один аудио-патч в день</b> — "
         "текст, перевод и несколько слов, которые больше всего отличаются от родного "
@@ -294,7 +331,8 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         "Команды:\n"
         "• /patch — хочу патч 🎧\n"
         "• /language — сменить язык\n"
-        "• раз в день в случайное время (как BeReal) сам придёт новый патч",
+        "• /level — уровень сложности (простой/средний/сложный)\n"
+        "• раз в день в случайное время сам придёт новый патч",
         reply_markup=_patch_keyboard(),
     )
 
@@ -310,7 +348,8 @@ async def cmd_language(message: Message, command: CommandObject, bot: Bot) -> No
             return
         db.set_user_language(message.from_user.id, arg)
         await message.answer(_switch_message(arg))
-        _maybe_expand(bot, message.from_user.id, arg, settings.native_language)
+        user = db.get_user(message.from_user.id)
+        _maybe_expand(bot, message.from_user.id, arg, settings.native_language, user.get("difficulty"))
         return
     await message.answer("Выбери язык, который хочешь учить:", reply_markup=_language_keyboard())
 
@@ -324,7 +363,46 @@ async def on_set_language(callback: CallbackQuery, bot: Bot) -> None:
     db.upsert_user(callback.from_user.id)
     db.set_user_language(callback.from_user.id, code)
     await callback.message.edit_text(_switch_message(code))
-    _maybe_expand(bot, callback.from_user.id, code, settings.native_language)
+    user = db.get_user(callback.from_user.id)
+    _maybe_expand(bot, callback.from_user.id, code, settings.native_language, user.get("difficulty"))
+    await callback.answer()
+
+
+@router.message(Command("level"))
+async def cmd_level(message: Message, bot: Bot) -> None:
+    db.upsert_user(message.from_user.id)
+    user = db.get_user(message.from_user.id)
+    current = user.get("difficulty")
+    await message.answer(
+        "Выбери уровень сложности патчей.\n\n"
+        f"Сейчас: <b>{_difficulty_label(current)}</b>\n\n"
+        "⚪️ <b>Без уровня</b> — обычный общий пул (как по умолчанию).\n"
+        "🟢🟡🔴 — патчи будут подбираться/генерироваться под выбранную сложность.",
+        reply_markup=_level_keyboard(current),
+    )
+
+
+@router.callback_query(F.data.startswith("setlevel:"))
+async def on_set_level(callback: CallbackQuery, bot: Bot) -> None:
+    raw = callback.data.split(":", 1)[1]
+    difficulty = None if raw == "none" else raw
+    if difficulty is not None and difficulty not in DIFFICULTY_LABELS:
+        await callback.answer("Неизвестный уровень", show_alert=True)
+        return
+    db.upsert_user(callback.from_user.id)
+    db.set_user_difficulty(callback.from_user.id, difficulty)
+    user = db.get_user(callback.from_user.id)
+    native = user.get("native_language", settings.native_language)
+    await callback.message.edit_text(
+        f"Готово! Уровень: <b>{_difficulty_label(difficulty)}</b>.\n\n"
+        + (
+            "Патчи будут из обычного общего пула."
+            if difficulty is None
+            else "Готовлю патчи под этот уровень — жми GET MORE через минуту, "
+            "если их ещё нет."
+        )
+    )
+    _maybe_expand(bot, callback.from_user.id, user["language"], native, difficulty)
     await callback.answer()
 
 
@@ -344,6 +422,7 @@ async def setup_commands(bot: Bot) -> None:
         [
             BotCommand(command="patch", description="Хочу патч 🎧"),
             BotCommand(command="language", description="Сменить изучаемый язык"),
+            BotCommand(command="level", description="Уровень сложности 📶"),
             BotCommand(command="start", description="Начать / показать текущий язык"),
         ]
     )

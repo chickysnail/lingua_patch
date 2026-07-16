@@ -68,11 +68,31 @@ _SNIPPET_SYSTEM = (
 )
 
 
+# Instruction appended to the prompt for each difficulty tier. None (the
+# default pool) adds nothing, keeping the original random-length behavior.
+DIFFICULTY_PROMPTS: dict[str, str] = {
+    "easy": (
+        "DIFFICULTY: EASY. Use only very common, high-frequency words and simple "
+        "present-tense sentences. Keep it to ONE short sentence. Avoid idioms, "
+        "slang, and rare vocabulary."
+    ),
+    "medium": (
+        "DIFFICULTY: MEDIUM. Use everyday conversational language with a mix of "
+        "tenses and some common phrasal expressions. 1-2 sentences."
+    ),
+    "hard": (
+        "DIFFICULTY: HARD. Use rich, idiomatic, native-level language: colloquialisms, "
+        "less common vocabulary, and more complex sentence structures. 2-4 sentences."
+    ),
+}
+
+
 def generate_snippet(
     language: str,
     native_language: str,
     theme: str | None = None,
     client: object | None = None,
+    difficulty: str | None = None,
 ) -> dict:
     """Generate a themed snippet (transcript + translation + vocabulary).
 
@@ -92,6 +112,9 @@ def generate_snippet(
         f"Native language: {native_name} ({native_language})\n"
         f"Theme: {theme}"
     )
+    diff_prompt = DIFFICULTY_PROMPTS.get(difficulty or "")
+    if diff_prompt:
+        user_msg += f"\n{diff_prompt}"
     resp = client.chat.completions.create(
         model=settings.openai_model,
         messages=[
