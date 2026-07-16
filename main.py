@@ -31,7 +31,9 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 import db
@@ -44,6 +46,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("lingua_patch")
 
 router = Router()
+
+# Set once in main(); used by /time handlers to (un)schedule per-user jobs.
+_scheduler: AsyncIOScheduler | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -168,14 +173,56 @@ async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
 
 
 async def deliver_to_all(bot: Bot) -> int:
-    users = db.get_active_users()
-    log.info("Daily run: delivering to %d active user(s).", len(users))
+    """Deliver the daily patch to users on the randomized window.
+
+    Users with a fixed ``send_time`` are handled by their own cron jobs.
+    """
+    users = db.get_random_time_users()
+    log.info("Daily run: delivering to %d random-window user(s).", len(users))
     sent = 0
     for user in users:
         if await deliver(bot, user):
             sent += 1
     log.info("Daily run complete: %d delivered.", sent)
     return sent
+
+
+async def deliver_to_user(bot: Bot, user_id: int) -> None:
+    """Deliver one patch to a single user (used by per-user fixed-time jobs)."""
+    user = db.get_user(user_id)
+    if not user or not user["is_active"]:
+        return
+    await deliver(bot, user)
+
+
+# --------------------------------------------------------------------------- #
+# Per-user fixed-time scheduling
+# --------------------------------------------------------------------------- #
+def _user_job_id(user_id: int) -> str:
+    return f"user_{user_id}"
+
+
+def schedule_user_job(
+    scheduler: AsyncIOScheduler, bot: Bot, user_id: int, send_time: str
+) -> None:
+    """Schedule (or replace) a daily delivery at ``send_time`` ('HH:MM')."""
+    hour, minute = (int(x) for x in send_time.split(":"))
+    scheduler.add_job(
+        deliver_to_user,
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=settings.timezone),
+        args=[bot, user_id],
+        id=_user_job_id(user_id),
+        replace_existing=True,
+    )
+    log.info("Scheduled daily patch for user %d at %s %s.", user_id, send_time, settings.timezone)
+
+
+def unschedule_user_job(scheduler: AsyncIOScheduler, user_id: int) -> None:
+    """Remove a user's fixed-time job (they fall back to the random window)."""
+    try:
+        scheduler.remove_job(_user_job_id(user_id))
+    except JobLookupError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -332,7 +379,8 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         "• /patch — хочу патч 🎧\n"
         "• /language — сменить язык\n"
         "• /level — уровень сложности (простой/средний/сложный)\n"
-        "• раз в день в случайное время сам придёт новый патч",
+        "• /time — настроить время отправки 🕒\n"
+        "• по умолчанию патч приходит раз в день в случайное время",
         reply_markup=_patch_keyboard(),
     )
 
@@ -416,6 +464,104 @@ async def on_patch_button(message: Message, bot: Bot) -> None:
     await send_patch_now(message, bot)
 
 
+# --------------------------------------------------------------------------- #
+# Delivery-time settings (/time)
+# --------------------------------------------------------------------------- #
+TIME_PRESETS: list[tuple[str, str]] = [
+    ("🌅 Утро · 08:00", "08:00"),
+    ("☀️ День · 13:00", "13:00"),
+    ("🌆 Вечер · 19:00", "19:00"),
+    ("🌙 Поздний вечер · 22:00", "22:00"),
+]
+
+
+def _time_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"settime:{val}")]
+            for label, val in TIME_PRESETS]
+    rows.append([InlineKeyboardButton(text="🎲 Случайное время", callback_data="settime:random")])
+    rows.append([InlineKeyboardButton(text="✍️ Своё время", callback_data="settime:custom")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _current_time_line(user: dict[str, Any]) -> str:
+    send_time = (user.get("send_time") or "").strip()
+    if send_time:
+        return f"Сейчас патч приходит в <b>{send_time}</b> ({settings.timezone})."
+    return "Сейчас патч приходит в <b>случайное время</b> днём."
+
+
+@router.message(Command("time"))
+async def cmd_time(message: Message, bot: Bot) -> None:
+    db.upsert_user(message.from_user.id)
+    user = db.get_user(message.from_user.id)
+    await message.answer(
+        "🕒 Когда присылать ежедневный патч?\n\n"
+        f"{_current_time_line(user)}\n\n"
+        "Выбери вариант или задай своё время. «Случайное» — как по умолчанию, "
+        "всегда можно вернуться к нему.",
+        reply_markup=_time_keyboard(),
+    )
+
+
+def _apply_time_choice(bot: Bot, user_id: int, value: str) -> str:
+    """Persist a time choice and (un)schedule the user's job. Returns a reply."""
+    if value == "random":
+        db.set_send_time(user_id, None)
+        if _scheduler is not None:
+            unschedule_user_job(_scheduler, user_id)
+        return "🎲 Готово! Патч будет приходить в случайное время днём."
+    db.set_send_time(user_id, value)
+    if _scheduler is not None:
+        schedule_user_job(_scheduler, bot, user_id, value)
+    return f"✅ Готово! Патч будет приходить каждый день в <b>{value}</b> ({settings.timezone})."
+
+
+@router.callback_query(F.data.startswith("settime:"))
+async def on_set_time(callback: CallbackQuery, bot: Bot) -> None:
+    db.upsert_user(callback.from_user.id)
+    value = callback.data.split(":", 1)[1]
+    if value == "custom":
+        db.set_awaiting_time(callback.from_user.id, True)
+        await callback.message.edit_text(
+            "✍️ Напиши время в формате <b>ЧЧ:ММ</b> (например, 08:30 или 21:15)."
+        )
+        await callback.answer()
+        return
+    reply = _apply_time_choice(bot, callback.from_user.id, value)
+    await callback.message.edit_text(reply)
+    await callback.answer()
+
+
+def _parse_time(text: str) -> str | None:
+    """Parse 'HH:MM' / 'H.MM' / 'HH MM' into a canonical 'HH:MM', or None."""
+    import re
+
+    m = re.match(r"^\s*(\d{1,2})[:.\s](\d{2})\s*$", text)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def on_text(message: Message, bot: Bot) -> None:
+    """Free text: parse a custom delivery time if we're awaiting one."""
+    db.upsert_user(message.from_user.id)
+    user = db.get_user(message.from_user.id)
+    if not user.get("awaiting_time"):
+        return
+    parsed = _parse_time(message.text)
+    if parsed is None:
+        await message.answer(
+            "Не понял время 🤔 Напиши в формате <b>ЧЧ:ММ</b>, например 08:30."
+        )
+        return
+    reply = _apply_time_choice(bot, message.from_user.id, parsed)
+    await message.answer(reply)
+
+
 async def setup_commands(bot: Bot) -> None:
     """Populate the public Telegram command menu."""
     await bot.set_my_commands(
@@ -423,6 +569,7 @@ async def setup_commands(bot: Bot) -> None:
             BotCommand(command="patch", description="Хочу патч 🎧"),
             BotCommand(command="language", description="Сменить изучаемый язык"),
             BotCommand(command="level", description="Уровень сложности 📶"),
+            BotCommand(command="time", description="Настроить время патча 🕒"),
             BotCommand(command="start", description="Начать / показать текущий язык"),
         ]
     )
@@ -461,14 +608,20 @@ async def main() -> None:
     dp.include_router(router)
     await setup_commands(bot)
 
+    global _scheduler
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
+    _scheduler = scheduler
     scheduler.start()
     run_at = schedule_next(scheduler, bot)
+    # Restore per-user fixed-time jobs for users who picked a time via /time.
+    fixed = db.get_users_with_fixed_time()
+    for u in fixed:
+        schedule_user_job(scheduler, bot, u["user_id"], u["send_time"])
     log.info(
         "Scheduler started: one random patch/day in [%02d:00, %02d:00) %s. "
-        "Next: %s. Pool size: %d.",
+        "Next: %s. Fixed-time users: %d. Pool size: %d.",
         settings.send_window_start_hour, settings.send_window_end_hour,
-        settings.timezone, run_at.isoformat(), db.count_content(),
+        settings.timezone, run_at.isoformat(), len(fixed), db.count_content(),
     )
 
     try:
