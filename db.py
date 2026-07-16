@@ -83,7 +83,6 @@ def init_db(db_path: Path | None = None) -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
-            CREATE INDEX IF NOT EXISTS idx_content_owner ON content_pool(owner_user_id);
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
         )
@@ -109,6 +108,11 @@ def init_db(db_path: Path | None = None) -> None:
             conn,
             "content_pool",
             {"owner_user_id": "INTEGER", "rules_version": "INTEGER"},
+        )
+        # Created after the migration above so it works on pre-existing DBs whose
+        # content_pool did not yet have the owner_user_id column.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_owner ON content_pool(owner_user_id)"
         )
 
 
