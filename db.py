@@ -44,7 +44,8 @@ def init_db(db_path: Path | None = None) -> None:
                 join_date       TEXT    NOT NULL,
                 is_active       INTEGER NOT NULL DEFAULT 1,
                 language        TEXT    NOT NULL,
-                native_language TEXT    NOT NULL
+                native_language TEXT    NOT NULL,
+                difficulty      TEXT
             );
 
             CREATE TABLE IF NOT EXISTS content_pool (
@@ -58,7 +59,8 @@ def init_db(db_path: Path | None = None) -> None:
                 source          TEXT    NOT NULL DEFAULT 'elevenlabs',
                 attribution     TEXT,
                 used_count      INTEGER NOT NULL DEFAULT 0,
-                created_at      TEXT    NOT NULL
+                created_at      TEXT    NOT NULL,
+                difficulty      TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sent_history (
@@ -84,6 +86,25 @@ def init_db(db_path: Path | None = None) -> None:
         if "tatoeba_id" in cols or "length" in cols:
             # SQLite doesn't support DROP COLUMN before 3.35; recreate the table.
             _migrate_drop_legacy_columns(conn)
+
+        # Migration: add the difficulty columns to pre-existing DBs.
+        _add_missing_columns(conn, "users", {"difficulty": "TEXT"})
+        _add_missing_columns(conn, "content_pool", {"difficulty": "TEXT"})
+        # Created after the migration so it also works on DBs whose content_pool
+        # did not yet have the difficulty column.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_difficulty ON content_pool(difficulty)"
+        )
+
+
+def _add_missing_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    """Add any of ``columns`` (name -> SQL type/decl) missing from ``table``."""
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
@@ -174,6 +195,14 @@ def set_user_language(user_id: int, language: str) -> None:
         conn.execute("UPDATE users SET language = ? WHERE user_id = ?", (language, user_id))
 
 
+def set_user_difficulty(user_id: int, difficulty: str | None) -> None:
+    """Set the learner's difficulty level, or None for the default (unmarked) pool."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE users SET difficulty = ? WHERE user_id = ?", (difficulty, user_id)
+        )
+
+
 def get_user(user_id: int) -> dict[str, Any] | None:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -199,13 +228,15 @@ def insert_content(
     vocabulary: list[dict[str, str]],
     source: str = "elevenlabs",
     attribution: str | None = None,
+    difficulty: str | None = None,
 ) -> int:
+    """Insert a patch. ``difficulty`` NULL means the default (unmarked) pool."""
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO content_pool "
             "(language, native_language, audio_path, transcript, translation, "
-            " vocabulary_json, source, attribution, used_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            " vocabulary_json, source, attribution, used_count, created_at, difficulty) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
             (
                 language,
                 native_language,
@@ -216,51 +247,71 @@ def insert_content(
                 source,
                 attribution,
                 _now(),
+                difficulty,
             ),
         )
         return int(cur.lastrowid)
 
 
-def count_content(language: str | None = None) -> int:
+def _difficulty_clause(difficulty: str | None) -> tuple[str, list[Any]]:
+    """WHERE fragment selecting the default (unmarked) pool vs. a difficulty tier.
+
+    ``difficulty is None`` -> ``difficulty IS NULL`` (default pool, unchanged);
+    otherwise -> ``difficulty = ?``.
+    """
+    if difficulty is None:
+        return "AND difficulty IS NULL", []
+    return "AND difficulty = ?", [difficulty]
+
+
+def count_content(language: str | None = None, difficulty: str | None = None) -> int:
+    clauses = []
+    params: list[Any] = []
     if language:
-        q = "SELECT COUNT(*) AS c FROM content_pool WHERE language = ?"
-        params: list[str] = [language]
-    else:
-        q = "SELECT COUNT(*) AS c FROM content_pool"
-        params = []
+        clauses.append("language = ?")
+        params.append(language)
+    if difficulty is not None:
+        clauses.append("difficulty = ?")
+        params.append(difficulty)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with _connect() as conn:
-        row = conn.execute(q, params).fetchone()
+        row = conn.execute(f"SELECT COUNT(*) AS c FROM content_pool{where}", params).fetchone()
         return int(row["c"])
 
 
-def count_unsent(user_id: int, language: str) -> int:
-    """How many items in ``language`` the user has not seen."""
+def count_unsent(user_id: int, language: str, difficulty: str | None = None) -> int:
+    """How many items in ``language`` at the given tier the user has not seen."""
+    scope, extra = _difficulty_clause(difficulty)
     with _connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM content_pool "
-            "WHERE language = ? "
+            f"WHERE language = ? {scope} "
             "  AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)",
-            (language, user_id),
+            [language, *extra, user_id],
         ).fetchone()
         return int(row["c"])
 
 
-def pick_unsent_content(user_id: int, language: str) -> dict[str, Any] | None:
+def pick_unsent_content(
+    user_id: int, language: str, difficulty: str | None = None
+) -> dict[str, Any] | None:
     """Return a content row in ``language`` the user has not received yet.
 
-    Returns None when every item has been seen — the caller is expected to
-    trigger pool expansion rather than recycling old content.
+    Scoped to the default unmarked pool (``difficulty is None``) or a specific
+    difficulty tier. Returns None when every item has been seen — the caller
+    then triggers pool expansion rather than recycling old content.
     """
+    scope, extra = _difficulty_clause(difficulty)
     with _connect() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT * FROM content_pool
-            WHERE language = ?
+            WHERE language = ? {scope}
               AND id NOT IN (SELECT content_id FROM sent_history WHERE user_id = ?)
             ORDER BY RANDOM()
             LIMIT 1
             """,
-            (language, user_id),
+            [language, *extra, user_id],
         ).fetchone()
         return dict(row) if row else None
 

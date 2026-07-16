@@ -27,8 +27,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("seed")
 
 
-def seed(language: str, native: str, count: int) -> int:
-    """Generate ``count`` AI-voiced patches for ``language`` and insert them."""
+def seed(
+    language: str, native: str, count: int, *, difficulty: str | None = None
+) -> int:
+    """Generate ``count`` AI-voiced patches for ``language`` and insert them.
+
+    ``difficulty`` (None/easy/medium/hard) tags the rows and shapes the prompt;
+    None keeps the default unmarked pool behavior.
+    """
     db.init_db()
 
     if not is_supported(language):
@@ -51,7 +57,9 @@ def seed(language: str, native: str, count: int) -> int:
     while inserted < count and attempts < count * 3:
         attempts += 1
         try:
-            snippet = content_mod.generate_snippet(language, native, client=openai_client)
+            snippet = content_mod.generate_snippet(
+                language, native, client=openai_client, difficulty=difficulty
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("Snippet generation failed: %s", exc)
             continue
@@ -79,6 +87,7 @@ def seed(language: str, native: str, count: int) -> int:
             vocabulary=snippet["vocabulary"],
             source="elevenlabs",
             attribution=voice_name,
+            difficulty=difficulty,
         )
         inserted += 1
         log.info("[%d/%d] seeded id=%d voice=%s theme=%s words=%d: %s",
@@ -95,10 +104,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--language", default=settings.default_language, help="target ISO 639-3 code, e.g. ukr")
     parser.add_argument("--native", default=settings.native_language, help="native ISO 639-3 code, e.g. rus")
     parser.add_argument("--count", type=int, default=10, help="number of items to seed")
+    parser.add_argument(
+        "--difficulty",
+        choices=["easy", "medium", "hard"],
+        default=None,
+        help="difficulty tier to tag/generate (default: unmarked pool)",
+    )
     args = parser.parse_args(argv)
 
     try:
-        seed(args.language, args.native, args.count)
+        seed(args.language, args.native, args.count, difficulty=args.difficulty)
     except Exception as exc:
         log.error("Seeding error: %s", exc)
         return 1
