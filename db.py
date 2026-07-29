@@ -263,6 +263,23 @@ def get_active_users() -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def get_all_users_with_stats() -> list[dict[str, Any]]:
+    """Every user plus their delivery counters, most recently active first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.*,
+                   COUNT(s.id)   AS patches_sent,
+                   MAX(s.sent_at) AS last_sent
+            FROM users u
+            LEFT JOIN sent_history s ON s.user_id = u.user_id
+            GROUP BY u.user_id
+            ORDER BY last_sent IS NULL, last_sent DESC, u.join_date DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 # --------------------------------------------------------------------------- #
 # Content
 # --------------------------------------------------------------------------- #
