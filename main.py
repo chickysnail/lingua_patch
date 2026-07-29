@@ -9,6 +9,7 @@ TTS). Users never receive the same patch twice.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import random
 from datetime import datetime, timedelta
@@ -488,6 +489,79 @@ def _current_time_line(user: dict[str, Any]) -> str:
     if send_time:
         return f"Сейчас патч приходит в <b>{send_time}</b> ({settings.timezone})."
     return "Сейчас патч приходит в <b>случайное время</b> днём."
+
+
+# --------------------------------------------------------------------------- #
+# Statistics (/stats)
+# --------------------------------------------------------------------------- #
+def _language_label(code: str) -> str:
+    if is_supported(code):
+        lang = get(code)
+        return f"{lang.flag} {lang.name}"
+    return code
+
+
+def _time_label(user: dict[str, Any]) -> str:
+    send_time = (user.get("send_time") or "").strip()
+    return f"🕒 {send_time}" if send_time else "🎲 случайное"
+
+
+def _short_date(iso: str | None) -> str:
+    """'2026-07-28T21:12:00+00:00' -> '2026-07-28'; '—' when missing."""
+    return iso.split("T")[0] if iso else "—"
+
+
+async def _display_name(bot: Bot, user_id: int) -> str:
+    """Resolve a user's @username (or full name) via Telegram; fall back to the id."""
+    try:
+        chat = await bot.get_chat(user_id)
+    except Exception:  # noqa: BLE001
+        return f"id {user_id}"
+    if chat.username:
+        return f"@{chat.username}"
+    name = " ".join(p for p in (chat.first_name, chat.last_name) if p)
+    return html.escape(name) if name else f"id {user_id}"
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message, bot: Bot) -> None:
+    """Admin-only overview of every user: language, level, delivery time, activity."""
+    if not settings.admin_id or message.from_user.id != settings.admin_id:
+        return
+
+    users = db.get_all_users_with_stats()
+    if not users:
+        await message.answer("В базе пока нет пользователей.")
+        return
+
+    lines = [f"📊 <b>Пользователи ({len(users)})</b> — время в {settings.timezone}"]
+    for u in users:
+        name = await _display_name(bot, u["user_id"])
+        flags = "" if u["is_active"] else " · 🚫 заблокировал"
+        lines.append(
+            f"\n<b>{name}</b> <code>{u['user_id']}</code>{flags}\n"
+            f"{_language_label(u['language'])} · {_difficulty_label(u.get('difficulty'))} · "
+            f"{_time_label(u)}\n"
+            f"патчей: {u['patches_sent']} · последний: {_short_date(u['last_sent'])} · "
+            f"с {_short_date(u.get('join_date'))}"
+        )
+    for chunk in _chunk_lines(lines):
+        await message.answer(chunk)
+
+
+def _chunk_lines(lines: list[str], limit: int = 3500) -> list[str]:
+    """Group lines into messages below Telegram's 4096-character cap."""
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 @router.message(Command("time"))
