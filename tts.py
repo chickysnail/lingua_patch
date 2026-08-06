@@ -82,6 +82,11 @@ NATIVE_VOICES: dict[str, list[tuple[str, str]]] = {
         ("Sandro Dutra", "qPfM2laM0pRL4rrZtBGl"),
         ("Borges", "9pDzHy2OpOgeXM8SeL0t"),
     ],
+    "por_pt": [
+        ("Joao", "ID3DiXGPB7uwug5tZ3FB"),
+        ("Luan Marçal", "jUbXe3S7NbhwunucutMG"),
+        ("Rodrigo", "A6CfBSp8JazAJyTxRmON"),
+    ],
     "spa": [
         ("El Faraon", "8mBRP99B2Ng2QwsJMFQl"),
         ("Martin Alvarez", "Wl3O9lmFSMgGFTTwuS6f"),

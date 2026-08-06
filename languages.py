@@ -1,6 +1,8 @@
 """Supported languages and their display / YouGlish metadata.
 
-Keys are ISO 639-3 codes. ``youglish`` is the slug YouGlish uses in its
+Keys are ISO 639-3 codes, optionally suffixed with ``_<region>`` when two
+variants of the same language are offered separately (``por`` vs ``por_pt``).
+``youglish`` is the slug YouGlish uses in its
 pronounce URLs: ``https://youglish.com/pronounce/<word>/<youglish-slug>``.
 """
 from __future__ import annotations
@@ -30,6 +32,7 @@ LANGUAGES: dict[str, Language] = {
     "spa": Language("spa", "Español", "🇪🇸", "spanish"),
     "ita": Language("ita", "Italiano", "🇮🇹", "italian"),
     "por": Language("por", "Português (Brasil)", "🇧🇷", "portuguese"),
+    "por_pt": Language("por_pt", "Português (Portugal)", "🇵🇹", "portuguese"),
     "tur": Language("tur", "Türkçe", "🇹🇷", "turkish"),
     # East Asian.
     "jpn": Language("jpn", "日本語", "🇯🇵", "japanese"),
@@ -43,7 +46,8 @@ ENGLISH_NAMES = {
     "pol": "Polish", "ces": "Czech",
     "eng": "English", "deu": "German", "fra": "French",
     "spa": "Spanish", "ita": "Italian",
-    "por": "Brazilian Portuguese", "tur": "Turkish",
+    "por": "Brazilian Portuguese", "por_pt": "European Portuguese (pt-PT)",
+    "tur": "Turkish",
     "jpn": "Japanese", "kor": "Korean", "zho": "Mandarin Chinese",
     "rus": "Russian",
 }
@@ -61,7 +65,7 @@ ISO_639_1 = {
     "ukr": "uk", "rus": "ru", "bul": "bg", "slk": "sk",
     "pol": "pl", "ces": "cs",
     "eng": "en", "deu": "de", "fra": "fr",
-    "spa": "es", "ita": "it", "por": "pt", "tur": "tr",
+    "spa": "es", "ita": "it", "por": "pt", "por_pt": "pt", "tur": "tr",
     "jpn": "ja", "kor": "ko", "zho": "zh",
 }
 
