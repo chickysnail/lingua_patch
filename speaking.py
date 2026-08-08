@@ -150,57 +150,7 @@ def _labels(native_language: str) -> dict[str, str]:
     return _LABELS.get(native_language, _LABELS["eng"])
 
 
-def _native_header(header: str, native_language: str | None) -> str:
-    """Replace common model placeholders with a learner-language table label."""
-    if not native_language:
-        return header
-    lower = header.lower()
-    labels = {
-        "rus": {
-            "subject": "подлежащее", "verb": "глагол",
-            "article": "артикль", "noun": "существительное",
-            "лиц": "подлежащее", "форм": "форма",
-        },
-        "eng": {
-            "subject": "subject", "verb": "verb",
-            "article": "article", "noun": "noun",
-        },
-        "ukr": {
-            "subject": "підмет", "verb": "дієслово",
-            "article": "артикль", "noun": "іменник",
-        },
-    }.get(native_language)
-    if not labels:
-        return header
-    for kind, value in labels.items():
-        if kind in lower:
-            return value
-    return header
-
-
-def _fallback_headers(headers: list[str], title: str, native_language: str | None) -> list[str]:
-    """Keep model placeholder headers from leaking into the learner's handout."""
-    if not native_language:
-        return headers
-    if not any(header == "..." or "<" in header for header in headers):
-        return headers
-    if "артикл" in title.lower() or "article" in title.lower():
-        values = {
-            "rus": ["артикль", "форма"],
-            "eng": ["article", "form"],
-            "ukr": ["артикль", "форма"],
-        }
-    else:
-        values = {
-            "rus": ["элемент", "форма"],
-            "eng": ["element", "form"],
-            "ukr": ["елемент", "форма"],
-        }
-    fallback = values.get(native_language, values["eng"])
-    return [fallback[i] if i < len(fallback) else fallback[-1] for i in range(len(headers))]
-
-
-def _table(item: object, native_language: str | None = None) -> dict:
+def _table(item: object) -> dict:
     """Normalise one grammar table, dropping rows that do not fit the headers."""
     if not isinstance(item, dict):
         return {
@@ -214,11 +164,12 @@ def _table(item: object, native_language: str | None = None) -> dict:
     title = str(item.get("title", "")).strip()
     raw_headers = item.get("headers", [])
     headers = (
-        [_native_header(str(cell).strip(), native_language)
-         for cell in raw_headers if str(cell).strip()]
+        [str(cell).strip() for cell in raw_headers if str(cell).strip()]
         if isinstance(raw_headers, list)
         else []
     )
+    if any(header == "..." or "<" in header or ">" in header for header in headers):
+        headers = []
     rows: list[list[str]] = []
     raw_rows = item.get("rows", [])
     for row in raw_rows if isinstance(raw_rows, list) else []:
@@ -230,17 +181,6 @@ def _table(item: object, native_language: str | None = None) -> dict:
         if headers:
             cells = (cells + [""] * len(headers))[: len(headers)]
         rows.append(cells)
-    pronoun_rows = [
-        row for row in rows
-        if row and any(gloss in row[0].lower() for gloss in ("(я)", "(ты)", "(он/она)", "(мы)", "(вы)", "(они)"))
-    ]
-    if len(pronoun_rows) >= 2:
-        headers = [
-            _native_header("subject", native_language),
-            _native_header("verb", native_language),
-        ]
-        rows = [row[:2] for row in rows]
-    headers = _fallback_headers(headers, title, native_language)
     return {
         "title": title,
         "explanation": str(item.get("explanation", "")).strip(),
@@ -312,7 +252,7 @@ def generate_exercise(
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
     grammar = [
-        _table(item, native_language)
+        _table(item)
         for item in payload.get("grammar", [])
         if isinstance(item, dict)
     ]
@@ -376,7 +316,7 @@ def build_exercise_html(exercise: dict) -> Path:
 
     sections: list[str] = []
     for raw_table in exercise.get("grammar", []):
-        table = _table(raw_table, native_language)
+        table = _table(raw_table)
         if not table["rows"]:
             continue
         head = (
