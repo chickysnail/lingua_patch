@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     bot_token: str = ""
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
+    elevenlabs_stt_api_key: str = ""
 
     # ElevenLabs settings. eleven_multilingual_v2 = best quality.
     elevenlabs_model: str = "eleven_multilingual_v2"

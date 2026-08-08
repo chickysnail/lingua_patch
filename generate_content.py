@@ -114,8 +114,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         seed(args.language, args.native, args.count, difficulty=args.difficulty)
-    except Exception as exc:
-        log.error("Seeding error: %s", exc)
+    except Exception:
+        log.exception("Seeding error")
         return 1
     return 0
 

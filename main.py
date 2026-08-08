@@ -12,6 +12,7 @@ import asyncio
 import html
 import logging
 import random
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 import db
+import speaking
 from config import settings
 from formatting import build_message
 from languages import LANGUAGES, get, is_supported
@@ -50,6 +52,9 @@ router = Router()
 
 # Set once in main(); used by /time handlers to (un)schedule per-user jobs.
 _scheduler: AsyncIOScheduler | None = None
+
+# In-memory state for the current speaking exercise per user. No DB persistence.
+_active_exercises: dict[int, dict[str, Any]] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -159,13 +164,23 @@ async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
 
     try:
         await bot.send_voice(user_id, voice=FSInputFile(audio_path))
-        await bot.send_message(user_id, build_message(content), disable_web_page_preview=True)
+        practice_button = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=LET_S_PRACTICE, callback_data=f"{PRACTICE_CALLBACK}:{content['id']}")]
+            ]
+        )
+        await bot.send_message(
+            user_id,
+            build_message(content),
+            reply_markup=practice_button,
+            disable_web_page_preview=True,
+        )
     except TelegramForbiddenError:
         log.info("User %s blocked the bot — deactivating.", user_id)
         db.set_user_active(user_id, False)
         return False
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Failed to deliver to %s: %s", user_id, exc)
+    except Exception:
+        log.exception("Failed to deliver to %s", user_id)
         return False
 
     db.record_sent(user_id, content["id"])
@@ -296,6 +311,11 @@ async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
 # Handlers
 # --------------------------------------------------------------------------- #
 PATCH_NOW_TEXT = "GET MORE"
+PRACTICE_TEXT = "Practice"
+
+
+LET_S_PRACTICE = "Let's practice"
+PRACTICE_CALLBACK = "practice"
 
 # Difficulty tiers. None (the default) uses the shared unmarked pool.
 DIFFICULTY_LABELS: dict[str, str] = {
@@ -324,12 +344,15 @@ def _level_keyboard(current: str | None) -> InlineKeyboardMarkup:
 
 
 def _patch_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent reply keyboard with a single 'GET MORE' button."""
+    """Persistent reply keyboard with patch and practice buttons."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=PATCH_NOW_TEXT)]],
+        keyboard=[
+            [KeyboardButton(text=PATCH_NOW_TEXT)],
+            [KeyboardButton(text=PRACTICE_TEXT)],
+        ],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Tap GET MORE for a patch",
+        input_field_placeholder="Tap GET MORE or Practice",
     )
 
 
@@ -463,6 +486,141 @@ async def cmd_patch(message: Message, bot: Bot) -> None:
 @router.message(F.text == PATCH_NOW_TEXT)
 async def on_patch_button(message: Message, bot: Bot) -> None:
     await send_patch_now(message, bot)
+
+
+# --------------------------------------------------------------------------- #
+# Speaking practice
+# --------------------------------------------------------------------------- #
+async def _start_practice(user_id: int, bot: Bot, context: str | None = None) -> None:
+    """Generate and send a speaking exercise."""
+    db.upsert_user(user_id)
+    user = db.get_user(user_id)
+    if not user:
+        await bot.send_message(user_id, "Не удалось найти пользователя.")
+        return
+
+    language = user["language"]
+    native = user.get("native_language", settings.native_language)
+    difficulty = user.get("difficulty")
+
+    try:
+        exercise = await asyncio.to_thread(
+            speaking.generate_exercise, language, native, difficulty, context
+        )
+    except Exception:
+        log.exception("Failed to generate exercise for user %s", user_id)
+        await bot.send_message(user_id, "Не удалось придумать упражнение. Попробуй ещё раз позже.")
+        return
+
+    if not exercise.get("source_sentence"):
+        await bot.send_message(user_id, "Не удалось придумать предложение. Попробуй ещё раз.")
+        return
+
+    html_path: Path | None = None
+    try:
+        html_path = speaking.build_exercise_html(exercise)
+        await bot.send_document(
+            user_id,
+            document=FSInputFile(html_path),
+            caption="Открой файл и запиши голосовое сообщение с переводом 🎙",
+        )
+    except Exception:
+        log.exception("Failed to send exercise for user %s", user_id)
+        await bot.send_message(user_id, "Не удалось отправить упражнение. Попробуй ещё раз.")
+        return
+    finally:
+        if html_path and html_path.exists():
+            html_path.unlink(missing_ok=True)
+
+    _active_exercises[user_id] = {
+        "source_sentence": exercise["source_sentence"],
+        "language": language,
+        "native_language": native,
+    }
+
+
+@router.callback_query(F.data.startswith(f"{PRACTICE_CALLBACK}:"))
+async def on_practice_callback(callback: CallbackQuery, bot: Bot) -> None:
+    """Inline 'Let's practice' button below a daily patch."""
+    content_id = callback.data.split(":", 1)[1]
+    try:
+        content_id_int = int(content_id)
+    except ValueError:
+        await callback.answer("Неверное упражнение", show_alert=True)
+        return
+
+    content = db.get_content(content_id_int)
+    if not content:
+        await callback.answer("Патч не найден", show_alert=True)
+        return
+
+    await callback.answer()
+    await _start_practice(callback.from_user.id, bot, context=content["transcript"])
+
+
+@router.message(Command("practice"))
+async def cmd_practice(message: Message, bot: Bot) -> None:
+    """Start a practice exercise from the command menu."""
+    await _start_practice(message.from_user.id, bot)
+
+
+@router.message(F.text == PRACTICE_TEXT)
+async def on_practice_button(message: Message, bot: Bot) -> None:
+    """Persistent reply-keyboard 'Practice' button."""
+    await _start_practice(message.from_user.id, bot)
+
+
+@router.message(F.voice)
+async def on_voice(message: Message, bot: Bot) -> None:
+    """Accept a voice answer to the current speaking exercise."""
+    user_id = message.from_user.id
+    exercise = _active_exercises.get(user_id)
+    if not exercise:
+        return
+
+    audio_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            await bot.download(message.voice, destination=tmp.name)
+            audio_path = Path(tmp.name)
+    except Exception:
+        log.exception("Failed to download voice from user %s", user_id)
+        await message.answer("Не удалось скачать голосовое. Попробуй ещё раз.")
+        return
+    finally:
+        if audio_path and audio_path.exists():
+            audio_path.unlink(missing_ok=True)
+
+    text: str | None = None
+    try:
+        text = await asyncio.to_thread(
+            speaking.transcribe_voice, audio_path, exercise["language"]
+        )
+    except Exception:
+        log.exception("STT failed for user %s", user_id)
+        await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
+        return
+
+    if not text:
+        await message.answer("Я ничего не услышал. Попробуй ещё раз.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            speaking.evaluate_translation,
+            exercise["source_sentence"],
+            text,
+            exercise["language"],
+            exercise["native_language"],
+        )
+    except Exception:
+        log.exception("Evaluation failed for user %s", user_id)
+        await message.answer("Не удалось оценить ответ. Попробуй ещё раз.")
+        return
+
+    response = f"<b>{html.escape(result['status'])}</b>\n\n{html.escape(result['feedback'])}"
+    await message.answer(response)
+    _active_exercises.pop(user_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -641,6 +799,7 @@ async def setup_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="patch", description="Хочу патч 🎧"),
+            BotCommand(command="practice", description="Практика 🎙"),
             BotCommand(command="language", description="Сменить изучаемый язык"),
             BotCommand(command="level", description="Уровень сложности 📶"),
             BotCommand(command="time", description="Настроить время патча 🕒"),

@@ -11,10 +11,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from config import settings
 
@@ -355,6 +356,13 @@ def count_unsent(user_id: int, language: str, difficulty: str | None = None) -> 
             [language, *extra, user_id],
         ).fetchone()
         return int(row["c"])
+
+
+def get_content(content_id: int) -> dict[str, Any] | None:
+    """Return a single content pool row by id."""
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM content_pool WHERE id = ?", (content_id,)).fetchone()
+        return dict(row) if row else None
 
 
 def pick_unsent_content(
