@@ -25,6 +25,15 @@ from languages import ENGLISH_NAMES, ISO_639_1, LANGUAGES, NATIVE_NAMES
 
 log = logging.getLogger(__name__)
 
+
+class STTError(RuntimeError):
+    """Speech-to-text service failed after the request was attempted."""
+
+
+class STTConfigurationError(STTError):
+    """Speech-to-text credentials are missing or rejected."""
+
+
 _EXERCISE_SYSTEM = (
     "You are a bilingual language teacher who speaks both the learner's native language "
     "and the target language. You produce ONE speaking exercise plus the theory the learner "
@@ -33,14 +42,23 @@ _EXERCISE_SYSTEM = (
     "- The source sentence is written in the NATIVE language; the learner will say it aloud "
     "in the target language. Keep it natural and appropriate to the level.\n"
     "- All explanations, notes and table headers are written in the NATIVE language; example "
-    "forms are in the target language.\n"
+    "forms are in the target language. Use a warm, conversational Duolingo Guidebook tone, "
+    "with playful short tip titles.\n"
     "- NEVER write the target-language translation of the source sentence, and never give a "
     "ready-made phrase that only has to be read out. Teach the pieces, not the answer.\n"
     "- 'grammar' must contain REAL tables: full conjugation of every verb the sentence needs, "
     "all persons of the tense the sentence actually requires (past sentence -> past tense table, "
     "not present), plus declensions, articles, pronoun or plural tables "
     "when the sentence needs them. Each table gets a title, a short explanation of when the "
-    "form is used, header cells and rows. Rows must have exactly as many cells as headers.\n"
+    "form is used, header cells and rows. Rows must have exactly as many cells as headers. "
+    "Table row labels MUST be target-language pronoun plus native gloss exactly like "
+    "'eu (я)', 'tu (ты)', 'ele/ela (он/она)', 'nós (мы)', 'vocês (вы)', "
+    "'eles/elas (они)' where applicable. Never use the academic words "
+    "'единственное', 'множественное', or 'лицо' in table labels.\n"
+    "- Each grammar item also has a short native-language 'notice' nudge (or empty string) "
+    "and one concrete 'example' object with target and native strings.\n"
+    "- Include 3-5 useful 'key_phrases' in the target language with native translations. "
+    "They must be different phrases, not the source sentence or its translation.\n"
     "- In 'vocabulary', 'word' is the TARGET-language dictionary form and 'translation' is its "
     "native-language meaning — never the other way round.\n"
     "- 'notes' explains word order and how the pieces combine (2-4 short items).\n"
@@ -49,8 +67,10 @@ _EXERCISE_SYSTEM = (
     '"vocabulary": [{"word": "<target-language dictionary form>", '
     '"translation": "<native-language meaning>", '
     '"note": "grammatical info, e.g. verb, 2nd conjugation / noun, feminine"}], '
-    '"grammar": [{"title": "...", "explanation": "...", "headers": ["...", "..."], '
-    '"rows": [["...", "..."]]}], '
+    '"grammar": [{"title": "...", "explanation": "...", "headers": ["subject", "verb"], '
+    '"rows": [["eu (я) eu", "falo говорю"]], "notice": "...", '
+    '"example": {"target": "...", "native": "..."}}], '
+    '"key_phrases": [{"target": "...", "native": "..."}], '
     '"notes": ["..."]}'
 )
 
@@ -71,22 +91,34 @@ _EVAL_TEMPLATE = (
 _LABELS: dict[str, dict[str, str]] = {
     "rus": {
         "title": "Теория",
+        "task": "Задание",
         "vocabulary": "Слова",
         "grammar": "Грамматика",
+        "key_phrases": "Полезные фразы",
+        "target": "Португальский",
+        "native": "Русский",
         "notes": "Как собрать фразу",
         "filename": "теория",
     },
     "eng": {
         "title": "Theory",
+        "task": "Task",
         "vocabulary": "Vocabulary",
         "grammar": "Grammar",
+        "key_phrases": "Key phrases",
+        "target": "Target",
+        "native": "Native",
         "notes": "Putting it together",
         "filename": "theory",
     },
     "ukr": {
         "title": "Теорія",
+        "task": "Завдання",
         "vocabulary": "Слова",
         "grammar": "Граматика",
+        "key_phrases": "Корисні фрази",
+        "target": "Португальська",
+        "native": "Українська",
         "notes": "Як скласти фразу",
         "filename": "теорія",
     },
@@ -111,11 +143,26 @@ def _labels(native_language: str) -> dict[str, str]:
     return _LABELS.get(native_language, _LABELS["eng"])
 
 
-def _table(item: dict) -> dict:
+def _table(item: object) -> dict:
     """Normalise one grammar table, dropping rows that do not fit the headers."""
-    headers = [str(cell).strip() for cell in item.get("headers", []) if str(cell).strip()]
+    if not isinstance(item, dict):
+        return {
+            "title": "",
+            "explanation": "",
+            "headers": [],
+            "rows": [],
+            "notice": "",
+            "example": {"target": "", "native": ""},
+        }
+    raw_headers = item.get("headers", [])
+    headers = (
+        [str(cell).strip() for cell in raw_headers if str(cell).strip()]
+        if isinstance(raw_headers, list)
+        else []
+    )
     rows: list[list[str]] = []
-    for row in item.get("rows", []):
+    raw_rows = item.get("rows", [])
+    for row in raw_rows if isinstance(raw_rows, list) else []:
         if not isinstance(row, list):
             continue
         cells = [str(cell).strip() for cell in row]
@@ -129,7 +176,28 @@ def _table(item: dict) -> dict:
         "explanation": str(item.get("explanation", "")).strip(),
         "headers": headers,
         "rows": rows,
+        "notice": str(item.get("notice", "")).strip(),
+        "example": _example(item.get("example")),
     }
+
+
+def _example(item: object) -> dict[str, str]:
+    if not isinstance(item, dict):
+        return {"target": "", "native": ""}
+    return {
+        "target": str(item.get("target", "")).strip(),
+        "native": str(item.get("native", "")).strip(),
+    }
+
+
+def _key_phrase(item: object) -> dict[str, str] | None:
+    if not isinstance(item, dict):
+        return None
+    target = str(item.get("target", "")).strip()
+    native = str(item.get("native", "")).strip()
+    if not target or not native:
+        return None
+    return {"target": target, "native": native}
 
 
 def generate_exercise(
@@ -174,6 +242,11 @@ def generate_exercise(
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
     grammar = [_table(item) for item in payload.get("grammar", []) if isinstance(item, dict)]
+    key_phrases = [
+        phrase
+        for item in payload.get("key_phrases", [])
+        if (phrase := _key_phrase(item)) is not None
+    ]
     return {
         "source_sentence": str(payload.get("source_sentence", "")).strip(),
         "vocabulary": [
@@ -183,9 +256,10 @@ def generate_exercise(
                 "note": str(item.get("note", "")).strip(),
             }
             for item in payload.get("vocabulary", [])
-            if str(item.get("word", "")).strip()
+            if isinstance(item, dict) and str(item.get("word", "")).strip()
         ],
         "grammar": [table for table in grammar if table["rows"]],
+        "key_phrases": key_phrases,
         "notes": [str(note).strip() for note in payload.get("notes", []) if str(note).strip()],
         "language": language,
         "native_language": native_language,
@@ -205,6 +279,7 @@ def build_exercise_html(exercise: dict) -> Path:
     native_language = exercise["native_language"]
     target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
     labels = _labels(native_language)
+    source_sentence = str(exercise.get("source_sentence", "")).strip()
 
     practice_dir = settings.media_dir / "practice"
     practice_dir.mkdir(parents=True, exist_ok=True)
@@ -244,9 +319,40 @@ def build_exercise_html(exercise: dict) -> Path:
             f"<p>{escape(table['explanation'])}</p>" if table["explanation"] else ""
         )
         title = f"<h3>{escape(table['title'])}</h3>" if table["title"] else ""
-        sections.append(f"{title}{explanation}<table>{head}<tbody>{body}</tbody></table>")
+        notice = (
+            f"<p class=\"notice\"><strong>Обрати внимание:</strong> "
+            f"{escape(table['notice'])}</p>"
+            if table["notice"]
+            else ""
+        )
+        example = table["example"]
+        example_html = (
+            "<p class=\"example\"><strong>"
+            f"{escape(example['target'])}</strong> — {escape(example['native'])}</p>"
+            if example["target"] and example["native"]
+            else ""
+        )
+        sections.append(
+            f"{title}{explanation}<table>{head}<tbody>{body}</tbody></table>"
+            f"{notice}{example_html}"
+        )
     grammar_html = (
         f"<h2>{escape(labels['grammar'])}</h2>\n" + "\n".join(sections) if sections else ""
+    )
+
+    phrase_rows = "".join(
+        f"<tr><td><strong>{escape(phrase['target'])}</strong></td>"
+        f"<td>{escape(phrase['native'])}</td></tr>"
+        for item in exercise.get("key_phrases", [])
+        if (phrase := _key_phrase(item)) is not None
+    )
+    phrases_html = (
+        f"<h2>{escape(labels['key_phrases'])}</h2><table>"
+        f"<thead><tr><th>{escape(labels['target'])}</th>"
+        f"<th>{escape(labels['native'])}</th></tr></thead>"
+        f"<tbody>{phrase_rows}</tbody></table>"
+        if phrase_rows
+        else ""
     )
 
     notes = exercise.get("notes", [])
@@ -272,12 +378,17 @@ h3 {{ font-size: 1em; margin-top: 1.4em; }}
 table {{ border-collapse: collapse; width: 100%; margin: 0.5em 0; }}
 th, td {{ border: 1px solid #666; padding: 0.4em 0.5em; text-align: left; vertical-align: top; }}
 th {{ background: #222; }}
+.task {{ border: 1px solid #666; border-radius: 0.5em; padding: 0.2em 0.8em; }}
+.notice {{ background: #332b00; border-left: 0.3em solid #f0c420; padding: 0.5em 0.8em; }}
+.example {{ background: #181818; padding: 0.5em 0.8em; }}
 </style>
 </head>
 <body>
+<section class="task"><h2>{escape(labels['task'])}</h2><p><strong>{escape(source_sentence)}</strong></p></section>
 <h1>{escape(target_name)} — {escape(labels['title'])}</h1>
 {vocab_html}
 {grammar_html}
+{phrases_html}
 {notes_html}
 </body>
 </html>"""
@@ -292,7 +403,7 @@ def transcribe_voice(audio_path: Path, language: str) -> str | None:
     Raises on API errors so the caller can decide what to tell the user.
     """
     if not settings.elevenlabs_stt_api_key:
-        raise RuntimeError("ELEVENLABS_STT_API_KEY is not set.")
+        raise STTConfigurationError("ELEVENLABS_STT_API_KEY is not set.")
 
     code = ISO_639_1.get(language)
     data: dict[str, str] = {"model_id": "scribe_v1"}
@@ -308,8 +419,12 @@ def transcribe_voice(audio_path: Path, language: str) -> str | None:
             files={"file": (audio_path.name, f, "audio/ogg")},
         )
     if resp.status_code != 200:
-        log.warning("STT failed (%s): %s", resp.status_code, resp.text[:200])
-        raise RuntimeError(f"STT failed ({resp.status_code})")
+        snippet = resp.text[:200].replace("\n", " ")
+        log.warning("STT failed (status=%s): %s", resp.status_code, snippet)
+        error = f"STT failed (status={resp.status_code}): {snippet}"
+        if resp.status_code in (401, 403):
+            raise STTConfigurationError(error)
+        raise STTError(error)
 
     payload = resp.json()
     text = str(payload.get("text", "")).strip()

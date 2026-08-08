@@ -68,8 +68,9 @@ and `railway.json` are included.
 
 1. **New Project → Deploy from GitHub repo** → pick `lingua_patch`. Railway builds
    the Dockerfile automatically.
-2. **Variables:** set `BOT_TOKEN`, `OPENAI_API_KEY`, and `ELEVENLABS_API_KEY`.
-   Optionally `ADMIN_ID`, `TIMEZONE`, `SEND_WINDOW_START_HOUR`,
+2. **Variables:** set `BOT_TOKEN`, `OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, and
+   `ELEVENLABS_STT_API_KEY` (an ElevenLabs key with the `speech_to_text`
+   permission). Optionally `ADMIN_ID`, `TIMEZONE`, `SEND_WINDOW_START_HOUR`,
    `SEND_WINDOW_END_HOUR`, `ELEVENLABS_MODEL`.
 3. **Volume:** add a volume mounted at **`/data`** (the image already points
    `DB_PATH=/data/bot.db` and `MEDIA_DIR=/data/media` there) so the DB + audio

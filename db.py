@@ -80,6 +80,14 @@ def init_db(db_path: Path | None = None) -> None:
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS active_exercises (
+                user_id         INTEGER PRIMARY KEY,
+                source_sentence TEXT NOT NULL,
+                language        TEXT NOT NULL,
+                native_language TEXT NOT NULL,
+                created_at      TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
@@ -159,6 +167,36 @@ def _migrate_drop_legacy_columns(conn: sqlite3.Connection) -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def set_active_exercise(
+    user_id: int, source_sentence: str, language: str, native_language: str
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO active_exercises "
+            "(user_id, source_sentence, language, native_language, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET source_sentence=excluded.source_sentence, "
+            "language=excluded.language, native_language=excluded.native_language, "
+            "created_at=excluded.created_at",
+            (user_id, source_sentence, language, native_language, _now()),
+        )
+
+
+def get_active_exercise(user_id: int) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT source_sentence, language, native_language, created_at "
+            "FROM active_exercises WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def clear_active_exercise(user_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM active_exercises WHERE user_id = ?", (user_id,))
 
 
 # --------------------------------------------------------------------------- #
