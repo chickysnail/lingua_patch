@@ -53,7 +53,8 @@ router = Router()
 # Set once in main(); used by /time handlers to (un)schedule per-user jobs.
 _scheduler: AsyncIOScheduler | None = None
 
-# In-memory state for the current speaking exercise per user. No DB persistence.
+# Small cache for the current speaking exercise; the DB is authoritative so a
+# restart does not lose an exercise.
 _active_exercises: dict[int, dict[str, Any]] = {}
 
 # Users whose exercise is being generated right now — guards against repeated taps.
@@ -558,11 +559,13 @@ async def _start_practice(user_id: int, bot: Bot, context: str | None = None) ->
             f"<b>{html.escape(exercise['source_sentence'])}</b>",
         )
 
-        _active_exercises[user_id] = {
+        exercise_state = {
             "source_sentence": exercise["source_sentence"],
             "language": language,
             "native_language": native,
         }
+        db.set_active_exercise(user_id, **exercise_state)
+        _active_exercises[user_id] = exercise_state
     finally:
         _generating_exercises.discard(user_id)
         try:
@@ -607,12 +610,27 @@ async def on_practice_button(message: Message, bot: Bot) -> None:
     await _start_practice(message.from_user.id, bot)
 
 
+async def _notify_admin_stt_failure(bot: Bot, user_id: int, kind: str, exc: Exception) -> None:
+    """Send a diagnostic STT failure to the configured admin without secrets."""
+    if not settings.admin_id:
+        return
+    try:
+        await bot.send_message(
+            settings.admin_id,
+            f"⚠️ {kind} for user <code>{user_id}</code>: "
+            f"<code>{html.escape(str(exc))}</code>",
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("Failed to notify admin about %s.", kind.lower())
+
+
 @router.message(F.voice)
 async def on_voice(message: Message, bot: Bot) -> None:
     """Accept a voice answer to the current speaking exercise."""
     user_id = message.from_user.id
-    exercise = _active_exercises.get(user_id)
+    exercise = db.get_active_exercise(user_id) or _active_exercises.get(user_id)
     if not exercise:
+        await message.answer("Сначала нажми «🎙 Практика», чтобы начать упражнение.")
         return
 
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
@@ -629,9 +647,23 @@ async def on_voice(message: Message, bot: Bot) -> None:
             text = await asyncio.to_thread(
                 speaking.transcribe_voice, audio_path, exercise["language"]
             )
-        except Exception:
+        except speaking.STTConfigurationError as exc:
+            log.exception("STT configuration failed for user %s", user_id)
+            await message.answer(
+                "Проверка голосового ответа пока не настроена. "
+                "Попробуй позже."
+            )
+            await _notify_admin_stt_failure(bot, user_id, "STT configuration failed", exc)
+            return
+        except speaking.STTError as exc:
             log.exception("STT failed for user %s", user_id)
             await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
+            await _notify_admin_stt_failure(bot, user_id, "STT failed", exc)
+            return
+        except Exception as exc:
+            log.exception("Unexpected STT failure for user %s", user_id)
+            await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
+            await _notify_admin_stt_failure(bot, user_id, "Unexpected STT failure", exc)
             return
     finally:
         audio_path.unlink(missing_ok=True)
@@ -655,6 +687,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
 
     response = f"<b>{html.escape(result['status'])}</b>\n\n{html.escape(result['feedback'])}"
     await message.answer(response)
+    db.clear_active_exercise(user_id)
     _active_exercises.pop(user_id, None)
 
 
