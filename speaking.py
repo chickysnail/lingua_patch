@@ -1,18 +1,16 @@
-"""Speaking exercise: generate a practice sentence plus a theory handout,
+"""Speaking exercise: generate a practice sentence plus theory,
 transcribe the learner's voice, and evaluate the translation.
 
-The sentence to translate is shown in Telegram. The HTML file is a pure
-textbook chapter — vocabulary, real conjugation/declension tables and
-construction notes written by a bilingual teacher — and never contains the
-answer.
+The sentence to translate is shown in Telegram. The theory is a rich message:
+the vocabulary table is visible right away and every other hint — each grammar
+table, the key phrases, the word-order notes — sits in its own collapsible
+block. It is a pure textbook chapter and never contains the answer.
 """
 from __future__ import annotations
 
 import json
 import logging
 import random
-import re
-import uuid
 from html import escape
 from pathlib import Path
 
@@ -31,7 +29,8 @@ MAX_ROWS_PER_TABLE = 12
 MAX_KEY_PHRASES = 5
 MAX_NOTES = 4
 MAX_CELL_CHARS = 200
-MAX_HTML_BYTES = 100_000
+# Telegram caps a rich message at 32768 characters; stay well below it.
+MAX_RICH_CHARS = 30_000
 
 
 class STTError(RuntimeError):
@@ -79,7 +78,7 @@ _EXERCISE_SYSTEM = (
     "- In 'vocabulary', 'word' is the TARGET-language dictionary form and 'translation' is its "
     "native-language meaning — never the other way round.\n"
     "- 'notes' explains word order and how the pieces combine (2-4 short items).\n"
-    "- Keep the handout concise: no more than 8 vocabulary items, 4 grammar tables, "
+    "- Keep the theory concise: no more than 8 vocabulary items, 4 grammar tables, "
     "12 rows per table, 5 key phrases, and 4 notes; keep each cell near 200 characters.\n"
     "Respond ONLY with JSON:\n"
     '{"source_sentence": "...", '
@@ -107,7 +106,7 @@ _EVAL_TEMPLATE = (
     '"feedback": "short suggestions in {native_name}"}}'
 )
 
-# HTML section headings per native language.
+# Section headings per native language.
 _LABELS: dict[str, dict[str, str]] = {
     "rus": {
         "title": "Теория",
@@ -117,7 +116,6 @@ _LABELS: dict[str, dict[str, str]] = {
         "key_phrases": "Полезные фразы",
         "notice": "Обрати внимание",
         "notes": "Как собрать фразу",
-        "filename": "теория",
     },
     "eng": {
         "title": "Theory",
@@ -127,7 +125,6 @@ _LABELS: dict[str, dict[str, str]] = {
         "key_phrases": "Key phrases",
         "notice": "Notice",
         "notes": "Putting it together",
-        "filename": "theory",
     },
     "ukr": {
         "title": "Теорія",
@@ -137,7 +134,6 @@ _LABELS: dict[str, dict[str, str]] = {
         "key_phrases": "Корисні фрази",
         "notice": "Зверни увагу",
         "notes": "Як скласти фразу",
-        "filename": "теорія",
     },
 }
 
@@ -236,10 +232,16 @@ def generate_exercise(
     language: str,
     native_language: str,
     difficulty: str | None = None,
-    context: str | None = None,
+    vocabulary_hint: list[str] | None = None,
     client: OpenAI | None = None,
 ) -> dict:
-    """Generate a speaking exercise: source sentence + theory for the handout."""
+    """Generate a speaking exercise: source sentence + theory.
+
+    ``vocabulary_hint`` carries a few words from a patch the learner just heard
+    so the exercise can reuse them. The patch text itself is never passed in:
+    the learner already knows its translation, so an exercise built from it
+    would be a memory test instead of a speaking one.
+    """
     client = _client(client)
     target_name = _target_name(language)
     native_name = _native_name(native_language)
@@ -249,13 +251,13 @@ def generate_exercise(
         f"Native language: {native_name} ({native_language})",
         f"Level: {difficulty or 'mixed'}",
     ]
-    if context:
+    parts.append(f"Theme: {random.choice(THEMES)}")
+    words = [word for word in (vocabulary_hint or []) if word.strip()][:MAX_VOCABULARY_ITEMS]
+    if words:
         parts.append(
-            "Context (a recent patch the user saw — use it as inspiration, "
-            "but do not copy it and keep the exercise short):\n" + context
+            "Words the learner met recently — reuse one or two of them in a brand-new "
+            "sentence about the theme above: " + ", ".join(words)
         )
-    else:
-        parts.append(f"Theme: {random.choice(THEMES)}")
     parts.append(
         f"Generate the source sentence in {native_name} and the theory needed to translate it "
         f"into {target_name}: {target_name} vocabulary in dictionary form with its {native_name} "
@@ -306,143 +308,159 @@ def generate_exercise(
     }
 
 
-def handout_filename(language: str, native_language: str) -> str:
-    """User-visible name for the theory file (Telegram shows it verbatim)."""
-    name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
-    name = re.sub(r"\s*\([^)]*\)", "", name).strip() or _target_name(language)
-    return f"{name} — {_labels(native_language)['filename']}.html"
+def _details(summary: str, body: str) -> str:
+    """One collapsible section; Telegram keeps it closed until tapped."""
+    return f"<details><summary>{summary}</summary>{body}</details>"
 
 
-def build_exercise_html(exercise: dict) -> Path:
-    """Render the theory handout as an HTML file and return its path."""
-    language = exercise["language"]
-    native_language = exercise["native_language"]
-    target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
-    native_name = _native_name(native_language)
-    labels = _labels(native_language)
-    source_sentence = str(exercise.get("source_sentence", "")).strip()
-
-    practice_dir = settings.media_dir / "practice"
-    practice_dir.mkdir(parents=True, exist_ok=True)
-    path = practice_dir / f"exercise_{uuid.uuid4().hex[:12]}.html"
-
-    vocab_html = "".join(
-        "<tr><td><strong>{word}</strong></td><td>{translation}</td><td>{note}</td></tr>".format(
-            word=escape(item["word"]),
-            translation=escape(item.get("translation", "")),
-            note=escape(item.get("note", "")),
-        )
-        for item in exercise.get("vocabulary", [])
+def _rich_table(headers: list[str], rows: list[list[str]]) -> str:
+    head = (
+        "<tr>" + "".join(f"<th>{escape(cell)}</th>" for cell in headers) + "</tr>"
+        if headers
+        else ""
     )
-    if vocab_html:
-        vocab_html = (
-            f"<h2>{escape(labels['vocabulary'])}</h2>\n"
-            f"<table>{vocab_html}</table>"
-        )
+    body = "".join(
+        "<tr>" + "".join(f"<td>{escape(cell)}</td>" for cell in row) + "</tr>"
+        for row in rows
+    )
+    return f"<table bordered striped>{head}{body}</table>"
 
+
+def _vocabulary_section(exercise: dict, labels: dict[str, str]) -> str:
+    """Visible-by-default vocabulary table — the first thing the learner sees."""
+    rows = [
+        [item["word"], item.get("translation", ""), item.get("note", "")]
+        for item in exercise.get("vocabulary", [])
+    ]
+    if not rows:
+        return ""
+    return f"<h3>{escape(labels['vocabulary'])}</h3>" + _rich_table([], rows)
+
+
+def _grammar_sections(exercise: dict, labels: dict[str, str]) -> list[str]:
+    """One collapsible block per grammar table, so hints open one at a time."""
     sections: list[str] = []
     for raw_table in exercise.get("grammar", []):
         table = _table(raw_table)
         if not table["rows"]:
             continue
-        head = (
-            "<thead><tr>"
-            + "".join(f"<th>{escape(cell)}</th>" for cell in table["headers"])
-            + "</tr></thead>"
-            if table["headers"]
-            else ""
-        )
-        body = "".join(
-            "<tr>" + "".join(f"<td>{escape(cell)}</td>" for cell in row) + "</tr>"
-            for row in table["rows"]
-        )
-        explanation = (
+        summary = escape(table["title"] or labels["grammar"])
+        body = (
             f"<p>{escape(table['explanation'])}</p>" if table["explanation"] else ""
-        )
-        title = f"<h3>{escape(table['title'])}</h3>" if table["title"] else ""
-        notice = (
-            f"<p class=\"notice\"><strong>{escape(labels['notice'])}:</strong> "
-            f"{escape(table['notice'])}</p>"
-            if table["notice"]
-            else ""
-        )
+        ) + _rich_table(table["headers"], table["rows"])
+        if table["notice"]:
+            body += (
+                f"<p>⚠️ <b>{escape(labels['notice'])}:</b> {escape(table['notice'])}</p>"
+            )
         example = table["example"]
-        example_html = (
-            "<p class=\"example\"><strong>"
-            f"{escape(example['target'])}</strong> — {escape(example['native'])}</p>"
-            if example["target"] and example["native"]
-            else ""
-        )
-        sections.append(
-            f"{title}{explanation}<table>{head}<tbody>{body}</tbody></table>"
-            f"{notice}{example_html}"
-        )
-    grammar_html = (
-        f"<h2>{escape(labels['grammar'])}</h2>\n" + "\n".join(sections) if sections else ""
-    )
+        if example["target"] and example["native"]:
+            body += (
+                f"<blockquote><b>{escape(example['target'])}</b> — "
+                f"{escape(example['native'])}</blockquote>"
+            )
+        sections.append(_details(summary, body))
+    return sections
 
-    phrase_rows = "".join(
-        f"<tr><td><strong>{escape(phrase['target'])}</strong></td>"
-        f"<td>{escape(phrase['native'])}</td></tr>"
+
+def _phrases_section(exercise: dict, labels: dict[str, str], target_name: str, native_name: str) -> str:
+    rows = [
+        [phrase["target"], phrase["native"]]
         for item in exercise.get("key_phrases", [])
         if (phrase := _key_phrase(item)) is not None
-    )
-    phrases_html = (
-        f"<h2>{escape(labels['key_phrases'])}</h2><table>"
-        f"<thead><tr><th>{escape(target_name)}</th>"
-        f"<th>{escape(native_name)}</th></tr></thead>"
-        f"<tbody>{phrase_rows}</tbody></table>"
-        if phrase_rows
-        else ""
-    )
+    ]
+    if not rows:
+        return ""
+    table = _rich_table([target_name, native_name], rows)
+    return _details(escape(labels["key_phrases"]), table)
 
+
+def _notes_section(exercise: dict, labels: dict[str, str]) -> str:
     notes = exercise.get("notes", [])
-    notes_html = (
-        f"<h2>{escape(labels['notes'])}</h2>\n<ul>"
-        + "".join(f"<li>{escape(note)}</li>" for note in notes)
-        + "</ul>"
-        if notes
-        else ""
-    )
+    if not notes:
+        return ""
+    items = "".join(f"<li>{escape(note)}</li>" for note in notes)
+    return _details(escape(labels["notes"]), f"<ul>{items}</ul>")
 
-    def _render(phrases: str, notes_section: str) -> str:
-        return f"""<!DOCTYPE html>
-<html lang="{escape(native_language)}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(target_name)} — {escape(labels['title'])}</title>
-<style>
-body {{ font-family: system-ui, sans-serif; max-width: 40em; margin: 1em auto; padding: 0 1em; line-height: 1.5; background: #000; color: #fff; }}
-h1 {{ font-size: 1.4em; }}
-h2 {{ font-size: 1.15em; margin-top: 1.8em; }}
-h3 {{ font-size: 1em; margin-top: 1.4em; }}
-table {{ border-collapse: collapse; width: 100%; margin: 0.5em 0; }}
-th, td {{ border: 1px solid #666; padding: 0.4em 0.5em; text-align: left; vertical-align: top; }}
-th {{ background: #222; }}
-.task {{ border: 1px solid #666; border-radius: 0.5em; padding: 0.2em 0.8em; }}
-.notice {{ background: #332b00; border-left: 0.3em solid #f0c420; padding: 0.5em 0.8em; }}
-.example {{ background: #181818; padding: 0.5em 0.8em; }}
-</style>
-</head>
-<body>
-<section class="task"><h2>{escape(labels['task'])}</h2><p><strong>{escape(source_sentence)}</strong></p></section>
-<h1>{escape(target_name)} — {escape(labels['title'])}</h1>
-{vocab_html}
-{grammar_html}
-{phrases}
-{notes_section}
-</body>
-</html>"""
-    html = _render(phrases_html, notes_html)
-    if len(html.encode("utf-8")) > MAX_HTML_BYTES:
-        log.warning("Practice handout exceeded %d bytes; dropping key phrases.", MAX_HTML_BYTES)
-        html = _render("", notes_html)
-    if len(html.encode("utf-8")) > MAX_HTML_BYTES:
-        log.warning("Practice handout still exceeded %d bytes; dropping notes.", MAX_HTML_BYTES)
-        html = _render("", "")
-    path.write_text(html, encoding="utf-8")
-    return path
+
+def build_exercise_rich_html(exercise: dict) -> str:
+    """Render the theory as rich-message HTML for ``sendRichMessage``.
+
+    The vocabulary table is expanded; every other hint is a separate
+    ``<details>`` block the learner can open on its own.
+    """
+    language = exercise["language"]
+    native_language = exercise["native_language"]
+    target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
+    native_name = _native_name(native_language)
+    labels = _labels(native_language)
+
+    header = f"<h2>📘 {escape(target_name)} — {escape(labels['title'])}</h2>"
+    sections = [
+        _vocabulary_section(exercise, labels),
+        *_grammar_sections(exercise, labels),
+        _phrases_section(exercise, labels, target_name, native_name),
+        _notes_section(exercise, labels),
+    ]
+    sections = [section for section in sections if section]
+
+    html = header + "".join(sections)
+    while len(html) > MAX_RICH_CHARS and sections:
+        log.warning("Practice theory exceeded %d chars; dropping a section.", MAX_RICH_CHARS)
+        sections.pop()
+        html = header + "".join(sections)
+    return html
+
+
+def build_exercise_fallback_html(exercise: dict) -> str:
+    """Render the theory with classic message formatting.
+
+    Used when the rich message is rejected: no tables or per-section
+    collapsing, but every block after the vocabulary is an expandable
+    blockquote, so the message still stays short.
+    """
+    language = exercise["language"]
+    target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
+    labels = _labels(exercise["native_language"])
+
+    lines = [f"📘 <b>{escape(target_name)} — {escape(labels['title'])}</b>"]
+    vocabulary = exercise.get("vocabulary", [])
+    if vocabulary:
+        lines.append(f"\n<b>{escape(labels['vocabulary'])}</b>")
+        lines += [
+            f"• <b>{escape(item['word'])}</b> — {escape(item.get('translation', ''))}"
+            for item in vocabulary
+        ]
+
+    def _quote(title: str, body: list[str]) -> str:
+        return (
+            f"\n<blockquote expandable><b>{escape(title)}</b>\n"
+            + "\n".join(body)
+            + "</blockquote>"
+        )
+
+    for raw_table in exercise.get("grammar", []):
+        table = _table(raw_table)
+        if not table["rows"]:
+            continue
+        body = [escape(table["explanation"])] if table["explanation"] else []
+        body += [" — ".join(escape(cell) for cell in row if cell) for row in table["rows"]]
+        if table["notice"]:
+            body.append(f"⚠️ {escape(table['notice'])}")
+        lines.append(_quote(table["title"] or labels["grammar"], body))
+
+    phrases = [
+        f"<b>{escape(phrase['target'])}</b> — {escape(phrase['native'])}"
+        for item in exercise.get("key_phrases", [])
+        if (phrase := _key_phrase(item)) is not None
+    ]
+    if phrases:
+        lines.append(_quote(labels["key_phrases"], phrases))
+
+    notes = [escape(note) for note in exercise.get("notes", [])]
+    if notes:
+        lines.append(_quote(labels["notes"], notes))
+
+    return "\n".join(lines)
 
 
 def transcribe_voice(audio_path: Path, language: str) -> str | None:

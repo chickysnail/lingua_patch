@@ -23,12 +23,14 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
+from aiogram.methods import SendRichMessage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputRichMessage,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -41,7 +43,7 @@ from apscheduler.triggers.date import DateTrigger
 import db
 import speaking
 from config import settings
-from formatting import build_message
+from formatting import build_message, vocab_list
 from languages import LANGUAGES, get, is_supported
 from tts import NoNativeVoiceError
 
@@ -500,7 +502,43 @@ ALREADY_GENERATING_TEXT = "Упражнение уже готовится, по�
 MAX_VOICE_DURATION_SECONDS = 60
 
 
-async def _start_practice(user_id: int, bot: Bot, context: str | None = None) -> None:
+def _patch_vocabulary(content: dict[str, Any]) -> list[str]:
+    """Words from a patch, used to seed a practice exercise.
+
+    Only the words travel to the generator — the patch text itself would give
+    the learner a sentence they already know the translation of.
+    """
+    return [
+        word
+        for item in vocab_list(content)
+        if (word := str(item.get("word", "")).strip())
+    ]
+
+
+async def _send_theory(user_id: int, bot: Bot, exercise: dict[str, Any]) -> None:
+    """Send the theory as a rich message with collapsible hint sections."""
+    try:
+        await bot(
+            SendRichMessage(
+                chat_id=user_id,
+                rich_message=InputRichMessage(
+                    html=speaking.build_exercise_rich_html(exercise),
+                    skip_entity_detection=True,
+                ),
+            )
+        )
+    except TelegramBadRequest:
+        log.warning("Rich theory rejected for user %s; sending plain formatting.", user_id)
+        await bot.send_message(
+            user_id,
+            speaking.build_exercise_fallback_html(exercise),
+            disable_web_page_preview=True,
+        )
+
+
+async def _start_practice(
+    user_id: int, bot: Bot, vocabulary_hint: list[str] | None = None
+) -> None:
     """Generate and send a speaking exercise.
 
     Generation takes a while, so the user gets an immediate status message and
@@ -525,7 +563,7 @@ async def _start_practice(user_id: int, bot: Bot, context: str | None = None) ->
     try:
         try:
             exercise = await asyncio.to_thread(
-                speaking.generate_exercise, language, native, difficulty, context
+                speaking.generate_exercise, language, native, difficulty, vocabulary_hint
             )
         except Exception:
             log.exception("Failed to generate exercise for user %s", user_id)
@@ -536,23 +574,12 @@ async def _start_practice(user_id: int, bot: Bot, context: str | None = None) ->
             await bot.send_message(user_id, "Не удалось придумать предложение. Попробуй ещё раз.")
             return
 
-        html_path: Path | None = None
         try:
-            html_path = speaking.build_exercise_html(exercise)
-            await bot.send_document(
-                user_id,
-                document=FSInputFile(
-                    html_path, filename=speaking.handout_filename(language, native)
-                ),
-                caption="📘 Теория: слова, таблицы форм и подсказки по построению фразы.",
-            )
+            await _send_theory(user_id, bot, exercise)
         except Exception:
             log.exception("Failed to send exercise for user %s", user_id)
             await bot.send_message(user_id, "Не удалось отправить упражнение. Попробуй ещё раз.")
             return
-        finally:
-            if html_path and html_path.exists():
-                html_path.unlink(missing_ok=True)
 
         await bot.send_message(
             user_id,
@@ -596,7 +623,9 @@ async def on_practice_callback(callback: CallbackQuery, bot: Bot) -> None:
         await callback.message.edit_reply_markup(reply_markup=None)
     except (TelegramBadRequest, AttributeError):
         pass
-    await _start_practice(callback.from_user.id, bot, context=content["transcript"])
+    await _start_practice(
+        callback.from_user.id, bot, vocabulary_hint=_patch_vocabulary(content)
+    )
 
 
 @router.message(Command("practice"))
