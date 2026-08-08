@@ -9,7 +9,8 @@ from content import youglish_url
 from languages import LANGUAGES
 
 
-def _vocab_list(content: dict[str, Any]) -> list[dict[str, str]]:
+def vocab_list(content: dict[str, Any]) -> list[dict[str, str]]:
+    """Vocabulary items stored on a content row, or an empty list."""
     raw = content.get("vocabulary_json") or "[]"
     try:
         return json.loads(raw)
@@ -35,7 +36,7 @@ def build_message(content: dict[str, Any]) -> str:
     if translation:
         lines += ["", f"<i>{escape(translation)}</i>"]
 
-    vocab = _vocab_list(content)
+    vocab = vocab_list(content)
     if vocab:
         lines += ["", "💡 <b>Словарик</b>"]
         for item in vocab:
