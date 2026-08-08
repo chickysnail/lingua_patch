@@ -44,17 +44,26 @@ _EXERCISE_SYSTEM = (
     "- All explanations, notes and table headers are written in the NATIVE language; example "
     "forms are in the target language. Use a warm, conversational Duolingo Guidebook tone, "
     "with playful short tip titles.\n"
+    "- Every table header, including the subject and verb headers, must be written in the "
+    "learner's NATIVE language, never English placeholders.\n"
     "- NEVER write the target-language translation of the source sentence, and never give a "
     "ready-made phrase that only has to be read out. Teach the pieces, not the answer.\n"
     "- 'grammar' must contain REAL tables: full conjugation of every verb the sentence needs, "
     "all persons of the tense the sentence actually requires (past sentence -> past tense table, "
     "not present), plus declensions, articles, pronoun or plural tables "
     "when the sentence needs them. Each table gets a title, a short explanation of when the "
-    "form is used, header cells and rows. Rows must have exactly as many cells as headers. "
+    "form is used, header cells and rows. For a conjugation table, use exactly TWO columns: "
+    "the native-language equivalent of 'subject' and 'verb/form'; every row is exactly "
+    "[target pronoun + native gloss, target-language form]. Never transpose the table. "
+    "Rows must have exactly as many cells as headers. "
     "Table row labels MUST be target-language pronoun plus native gloss exactly like "
     "'eu (я)', 'tu (ты)', 'ele/ela (он/она)', 'nós (мы)', 'vocês (вы)', "
     "'eles/elas (они)' where applicable. Never use the academic words "
     "'единственное', 'множественное', or 'лицо' in table labels.\n"
+    "- Every conjugated or declined form must be the real, correct form for that exact "
+    "pronoun and tense. Do not repeat a form across different pronouns unless the language "
+    "genuinely shares that form. Re-check every table row against the actual paradigm before "
+    "returning the JSON.\n"
     "- Each grammar item also has a short native-language 'notice' nudge (or empty string) "
     "and one concrete 'example' object with target and native strings.\n"
     "- Include 3-5 useful 'key_phrases' in the target language with native translations. "
@@ -67,8 +76,9 @@ _EXERCISE_SYSTEM = (
     '"vocabulary": [{"word": "<target-language dictionary form>", '
     '"translation": "<native-language meaning>", '
     '"note": "grammatical info, e.g. verb, 2nd conjugation / noun, feminine"}], '
-    '"grammar": [{"title": "...", "explanation": "...", "headers": ["subject", "verb"], '
-    '"rows": [["eu (я) eu", "falo говорю"]], "notice": "...", '
+    '"grammar": [{"title": "...", "explanation": "...", '
+    '"headers": ["...", "..."], '
+    '"rows": [["<target pronoun> (<native gloss>)", "<target form>"]], "notice": "...", '
     '"example": {"target": "...", "native": "..."}}], '
     '"key_phrases": [{"target": "...", "native": "..."}], '
     '"notes": ["..."]}'
@@ -95,8 +105,7 @@ _LABELS: dict[str, dict[str, str]] = {
         "vocabulary": "Слова",
         "grammar": "Грамматика",
         "key_phrases": "Полезные фразы",
-        "target": "Португальский",
-        "native": "Русский",
+        "notice": "Обрати внимание",
         "notes": "Как собрать фразу",
         "filename": "теория",
     },
@@ -106,8 +115,7 @@ _LABELS: dict[str, dict[str, str]] = {
         "vocabulary": "Vocabulary",
         "grammar": "Grammar",
         "key_phrases": "Key phrases",
-        "target": "Target",
-        "native": "Native",
+        "notice": "Notice",
         "notes": "Putting it together",
         "filename": "theory",
     },
@@ -117,8 +125,7 @@ _LABELS: dict[str, dict[str, str]] = {
         "vocabulary": "Слова",
         "grammar": "Граматика",
         "key_phrases": "Корисні фрази",
-        "target": "Португальська",
-        "native": "Українська",
+        "notice": "Зверни увагу",
         "notes": "Як скласти фразу",
         "filename": "теорія",
     },
@@ -143,7 +150,57 @@ def _labels(native_language: str) -> dict[str, str]:
     return _LABELS.get(native_language, _LABELS["eng"])
 
 
-def _table(item: object) -> dict:
+def _native_header(header: str, native_language: str | None) -> str:
+    """Replace common model placeholders with a learner-language table label."""
+    if not native_language:
+        return header
+    lower = header.lower()
+    labels = {
+        "rus": {
+            "subject": "подлежащее", "verb": "глагол",
+            "article": "артикль", "noun": "существительное",
+            "лиц": "подлежащее", "форм": "форма",
+        },
+        "eng": {
+            "subject": "subject", "verb": "verb",
+            "article": "article", "noun": "noun",
+        },
+        "ukr": {
+            "subject": "підмет", "verb": "дієслово",
+            "article": "артикль", "noun": "іменник",
+        },
+    }.get(native_language)
+    if not labels:
+        return header
+    for kind, value in labels.items():
+        if kind in lower:
+            return value
+    return header
+
+
+def _fallback_headers(headers: list[str], title: str, native_language: str | None) -> list[str]:
+    """Keep model placeholder headers from leaking into the learner's handout."""
+    if not native_language:
+        return headers
+    if not any(header == "..." or "<" in header for header in headers):
+        return headers
+    if "артикл" in title.lower() or "article" in title.lower():
+        values = {
+            "rus": ["артикль", "форма"],
+            "eng": ["article", "form"],
+            "ukr": ["артикль", "форма"],
+        }
+    else:
+        values = {
+            "rus": ["элемент", "форма"],
+            "eng": ["element", "form"],
+            "ukr": ["елемент", "форма"],
+        }
+    fallback = values.get(native_language, values["eng"])
+    return [fallback[i] if i < len(fallback) else fallback[-1] for i in range(len(headers))]
+
+
+def _table(item: object, native_language: str | None = None) -> dict:
     """Normalise one grammar table, dropping rows that do not fit the headers."""
     if not isinstance(item, dict):
         return {
@@ -154,9 +211,11 @@ def _table(item: object) -> dict:
             "notice": "",
             "example": {"target": "", "native": ""},
         }
+    title = str(item.get("title", "")).strip()
     raw_headers = item.get("headers", [])
     headers = (
-        [str(cell).strip() for cell in raw_headers if str(cell).strip()]
+        [_native_header(str(cell).strip(), native_language)
+         for cell in raw_headers if str(cell).strip()]
         if isinstance(raw_headers, list)
         else []
     )
@@ -171,8 +230,19 @@ def _table(item: object) -> dict:
         if headers:
             cells = (cells + [""] * len(headers))[: len(headers)]
         rows.append(cells)
+    pronoun_rows = [
+        row for row in rows
+        if row and any(gloss in row[0].lower() for gloss in ("(я)", "(ты)", "(он/она)", "(мы)", "(вы)", "(они)"))
+    ]
+    if len(pronoun_rows) >= 2:
+        headers = [
+            _native_header("subject", native_language),
+            _native_header("verb", native_language),
+        ]
+        rows = [row[:2] for row in rows]
+    headers = _fallback_headers(headers, title, native_language)
     return {
-        "title": str(item.get("title", "")).strip(),
+        "title": title,
         "explanation": str(item.get("explanation", "")).strip(),
         "headers": headers,
         "rows": rows,
@@ -241,7 +311,11 @@ def generate_exercise(
         temperature=0.8,
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
-    grammar = [_table(item) for item in payload.get("grammar", []) if isinstance(item, dict)]
+    grammar = [
+        _table(item, native_language)
+        for item in payload.get("grammar", [])
+        if isinstance(item, dict)
+    ]
     key_phrases = [
         phrase
         for item in payload.get("key_phrases", [])
@@ -278,6 +352,7 @@ def build_exercise_html(exercise: dict) -> Path:
     language = exercise["language"]
     native_language = exercise["native_language"]
     target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
+    native_name = _native_name(native_language)
     labels = _labels(native_language)
     source_sentence = str(exercise.get("source_sentence", "")).strip()
 
@@ -301,7 +376,7 @@ def build_exercise_html(exercise: dict) -> Path:
 
     sections: list[str] = []
     for raw_table in exercise.get("grammar", []):
-        table = _table(raw_table)
+        table = _table(raw_table, native_language)
         if not table["rows"]:
             continue
         head = (
@@ -320,7 +395,7 @@ def build_exercise_html(exercise: dict) -> Path:
         )
         title = f"<h3>{escape(table['title'])}</h3>" if table["title"] else ""
         notice = (
-            f"<p class=\"notice\"><strong>Обрати внимание:</strong> "
+            f"<p class=\"notice\"><strong>{escape(labels['notice'])}:</strong> "
             f"{escape(table['notice'])}</p>"
             if table["notice"]
             else ""
@@ -348,8 +423,8 @@ def build_exercise_html(exercise: dict) -> Path:
     )
     phrases_html = (
         f"<h2>{escape(labels['key_phrases'])}</h2><table>"
-        f"<thead><tr><th>{escape(labels['target'])}</th>"
-        f"<th>{escape(labels['native'])}</th></tr></thead>"
+        f"<thead><tr><th>{escape(target_name)}</th>"
+        f"<th>{escape(native_name)}</th></tr></thead>"
         f"<tbody>{phrase_rows}</tbody></table>"
         if phrase_rows
         else ""

@@ -610,6 +610,20 @@ async def on_practice_button(message: Message, bot: Bot) -> None:
     await _start_practice(message.from_user.id, bot)
 
 
+async def _notify_admin_stt_failure(bot: Bot, user_id: int, kind: str, exc: Exception) -> None:
+    """Send a diagnostic STT failure to the configured admin without secrets."""
+    if not settings.admin_id:
+        return
+    try:
+        await bot.send_message(
+            settings.admin_id,
+            f"⚠️ {kind} for user <code>{user_id}</code>: "
+            f"<code>{html.escape(str(exc))}</code>",
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("Failed to notify admin about %s.", kind.lower())
+
+
 @router.message(F.voice)
 async def on_voice(message: Message, bot: Bot) -> None:
     """Accept a voice answer to the current speaking exercise."""
@@ -639,41 +653,17 @@ async def on_voice(message: Message, bot: Bot) -> None:
                 "Проверка голосового ответа пока не настроена. "
                 "Попробуй позже."
             )
-            if settings.admin_id:
-                try:
-                    await bot.send_message(
-                        settings.admin_id,
-                        f"⚠️ STT configuration failed for user <code>{user_id}</code>: "
-                        f"<code>{html.escape(str(exc))}</code>",
-                    )
-                except Exception:  # noqa: BLE001
-                    log.warning("Failed to notify admin about STT configuration failure.")
+            await _notify_admin_stt_failure(bot, user_id, "STT configuration failed", exc)
             return
         except speaking.STTError as exc:
             log.exception("STT failed for user %s", user_id)
             await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
-            if settings.admin_id:
-                try:
-                    await bot.send_message(
-                        settings.admin_id,
-                        f"⚠️ STT failed for user <code>{user_id}</code>: "
-                        f"<code>{html.escape(str(exc))}</code>",
-                    )
-                except Exception:  # noqa: BLE001
-                    log.warning("Failed to notify admin about STT failure.")
+            await _notify_admin_stt_failure(bot, user_id, "STT failed", exc)
             return
         except Exception as exc:
             log.exception("Unexpected STT failure for user %s", user_id)
             await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
-            if settings.admin_id:
-                try:
-                    await bot.send_message(
-                        settings.admin_id,
-                        f"⚠️ Unexpected STT failure for user <code>{user_id}</code>: "
-                        f"<code>{html.escape(str(exc))}</code>",
-                    )
-                except Exception:  # noqa: BLE001
-                    log.warning("Failed to notify admin about unexpected STT failure.")
+            await _notify_admin_stt_failure(bot, user_id, "Unexpected STT failure", exc)
             return
     finally:
         audio_path.unlink(missing_ok=True)
