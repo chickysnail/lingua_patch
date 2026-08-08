@@ -27,6 +27,8 @@ class Settings(BaseSettings):
 
     # OpenAI model for text generation and vocabulary extraction.
     openai_model: str = "gpt-4o-mini"
+    # Stronger model for interactive speaking exercise generation/evaluation.
+    openai_exercise_model: str = "gpt-4o"
 
     # Pool auto-expansion: when a user has <= topup_threshold unseen patches for
     # their language, a background job generates topup_count new items.
