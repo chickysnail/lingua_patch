@@ -85,7 +85,8 @@ def init_db(db_path: Path | None = None) -> None:
                 source_sentence TEXT NOT NULL,
                 language        TEXT NOT NULL,
                 native_language TEXT NOT NULL,
-                created_at      TEXT NOT NULL
+                created_at      TEXT NOT NULL,
+                turns_json      TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
@@ -109,6 +110,9 @@ def init_db(db_path: Path | None = None) -> None:
             },
         )
         _add_missing_columns(conn, "content_pool", {"difficulty": "TEXT"})
+        _add_missing_columns(
+            conn, "active_exercises", {"turns_json": "TEXT NOT NULL DEFAULT '[]'"}
+        )
         # Created after the migration so it also works on DBs whose content_pool
         # did not yet have the difficulty column.
         conn.execute(
@@ -172,26 +176,59 @@ def _now() -> str:
 def set_active_exercise(
     user_id: int, source_sentence: str, language: str, native_language: str
 ) -> None:
+    """Start a practice session, wiping the conversation of the previous one."""
     with _connect() as conn:
         conn.execute(
             "INSERT INTO active_exercises "
-            "(user_id, source_sentence, language, native_language, created_at) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "(user_id, source_sentence, language, native_language, created_at, turns_json) "
+            "VALUES (?, ?, ?, ?, ?, '[]') "
             "ON CONFLICT(user_id) DO UPDATE SET source_sentence=excluded.source_sentence, "
             "language=excluded.language, native_language=excluded.native_language, "
-            "created_at=excluded.created_at",
+            "created_at=excluded.created_at, turns_json='[]'",
             (user_id, source_sentence, language, native_language, _now()),
         )
 
 
 def get_active_exercise(user_id: int) -> dict[str, Any] | None:
+    """The exercise the user is working on, with the conversation so far."""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT source_sentence, language, native_language, created_at "
+            "SELECT source_sentence, language, native_language, created_at, turns_json "
             "FROM active_exercises WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        exercise = dict(row)
+        exercise["turns"] = _load_turns(exercise.pop("turns_json"))
+        return exercise
+
+
+def _load_turns(raw: object) -> list[dict[str, str]]:
+    try:
+        turns = json.loads(str(raw or "[]"))
+    except json.JSONDecodeError:
+        return []
+    return [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
+
+
+def append_exercise_turns(user_id: int, turns: list[dict[str, str]]) -> None:
+    """Append turns to the running practice conversation.
+
+    A no-op when the exercise was wiped meanwhile (new practice or new patch),
+    so a late reply never resurrects a finished session.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT turns_json FROM active_exercises WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return
+        history = _load_turns(row["turns_json"]) + turns
+        conn.execute(
+            "UPDATE active_exercises SET turns_json = ? WHERE user_id = ?",
+            (json.dumps(history, ensure_ascii=False), user_id),
+        )
 
 
 def clear_active_exercise(user_id: int) -> None:
