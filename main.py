@@ -556,8 +556,7 @@ async def _start_practice(user_id: int, bot: Bot, context: str | None = None) ->
 
         await bot.send_message(
             user_id,
-            "🎙 Переведи и запиши голосовое:\n\n"
-            "Ответ — до 1 минуты:\n\n"
+            "🎙 Переведи и запиши голосовое до 1 минуты:\n\n"
             f"<b>{html.escape(exercise['source_sentence'])}</b>",
         )
 
@@ -630,8 +629,10 @@ async def _notify_admin_stt_failure(bot: Bot, user_id: int, kind: str, exc: Exce
 async def on_voice(message: Message, bot: Bot) -> None:
     """Accept a voice answer to the current speaking exercise."""
     user_id = message.from_user.id
-    if (getattr(message.voice, "duration", 0) or 0) > MAX_VOICE_DURATION_SECONDS:
-        await message.answer("Голосовое слишком длинное. Запиши ответ до 1 минуты и попробуй ещё раз.")
+    if message.voice.duration > MAX_VOICE_DURATION_SECONDS:
+        await message.answer(
+            "Голосовое слишком длинное. Запиши ответ до 1 минуты и попробуй ещё раз."
+        )
         return
     exercise = db.get_active_exercise(user_id) or _active_exercises.get(user_id)
     if not exercise:

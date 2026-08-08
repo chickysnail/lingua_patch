@@ -167,6 +167,11 @@ def _clip(value: object) -> str:
     return text[: MAX_CELL_CHARS - 1].rstrip() + "…"
 
 
+def _bounded_list(value: object, limit: int) -> list:
+    """Return at most ``limit`` items, or an empty list for malformed payloads."""
+    return value[:limit] if isinstance(value, list) else []
+
+
 def _table(item: object) -> dict:
     """Normalise one grammar table, dropping rows that do not fit the headers."""
     if not isinstance(item, dict):
@@ -268,14 +273,18 @@ def generate_exercise(
         temperature=0.8,
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
+    vocabulary_items = _bounded_list(payload.get("vocabulary"), MAX_VOCABULARY_ITEMS)
+    grammar_items = _bounded_list(payload.get("grammar"), MAX_GRAMMAR_TABLES)
+    phrase_items = _bounded_list(payload.get("key_phrases"), MAX_KEY_PHRASES)
+    note_items = _bounded_list(payload.get("notes"), MAX_NOTES)
     grammar = [
         _table(item)
-        for item in payload.get("grammar", [])
+        for item in grammar_items
         if isinstance(item, dict)
     ]
     key_phrases = [
         phrase
-        for item in payload.get("key_phrases", [])
+        for item in phrase_items
         if (phrase := _key_phrase(item)) is not None
     ]
     return {
@@ -286,12 +295,12 @@ def generate_exercise(
                 "translation": _clip(item.get("translation", "")),
                 "note": _clip(item.get("note", "")),
             }
-            for item in payload.get("vocabulary", [])[:MAX_VOCABULARY_ITEMS]
+            for item in vocabulary_items
             if isinstance(item, dict) and str(item.get("word", "")).strip()
         ],
-        "grammar": [table for table in grammar[:MAX_GRAMMAR_TABLES] if table["rows"]],
-        "key_phrases": key_phrases[:MAX_KEY_PHRASES],
-        "notes": [_clip(note) for note in payload.get("notes", [])[:MAX_NOTES] if str(note).strip()],
+        "grammar": [table for table in grammar if table["rows"]],
+        "key_phrases": key_phrases,
+        "notes": [_clip(note) for note in note_items if str(note).strip()],
         "language": language,
         "native_language": native_language,
     }
