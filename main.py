@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
@@ -55,6 +55,9 @@ _scheduler: AsyncIOScheduler | None = None
 
 # In-memory state for the current speaking exercise per user. No DB persistence.
 _active_exercises: dict[int, dict[str, Any]] = {}
+
+# Users whose exercise is being generated right now — guards against repeated taps.
+_generating_exercises: set[int] = set()
 
 
 # --------------------------------------------------------------------------- #
@@ -491,8 +494,20 @@ async def on_patch_button(message: Message, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Speaking practice
 # --------------------------------------------------------------------------- #
+GENERATING_TEXT = "⏳ Придумываю упражнение и готовлю теорию — минутку…"
+ALREADY_GENERATING_TEXT = "Упражнение уже готовится, подожди немного 🙏"
+
+
 async def _start_practice(user_id: int, bot: Bot, context: str | None = None) -> None:
-    """Generate and send a speaking exercise."""
+    """Generate and send a speaking exercise.
+
+    Generation takes a while, so the user gets an immediate status message and
+    repeated taps are ignored until the current exercise is ready.
+    """
+    if user_id in _generating_exercises:
+        await bot.send_message(user_id, ALREADY_GENERATING_TEXT)
+        return
+
     db.upsert_user(user_id)
     user = db.get_user(user_id)
     if not user:
@@ -503,40 +518,57 @@ async def _start_practice(user_id: int, bot: Bot, context: str | None = None) ->
     native = user.get("native_language", settings.native_language)
     difficulty = user.get("difficulty")
 
+    _generating_exercises.add(user_id)
+    status = await bot.send_message(user_id, GENERATING_TEXT)
     try:
-        exercise = await asyncio.to_thread(
-            speaking.generate_exercise, language, native, difficulty, context
-        )
-    except Exception:
-        log.exception("Failed to generate exercise for user %s", user_id)
-        await bot.send_message(user_id, "Не удалось придумать упражнение. Попробуй ещё раз позже.")
-        return
+        try:
+            exercise = await asyncio.to_thread(
+                speaking.generate_exercise, language, native, difficulty, context
+            )
+        except Exception:
+            log.exception("Failed to generate exercise for user %s", user_id)
+            await bot.send_message(user_id, "Не удалось придумать упражнение. Попробуй ещё раз позже.")
+            return
 
-    if not exercise.get("source_sentence"):
-        await bot.send_message(user_id, "Не удалось придумать предложение. Попробуй ещё раз.")
-        return
+        if not exercise.get("source_sentence"):
+            await bot.send_message(user_id, "Не удалось придумать предложение. Попробуй ещё раз.")
+            return
 
-    html_path: Path | None = None
-    try:
-        html_path = speaking.build_exercise_html(exercise)
-        await bot.send_document(
+        html_path: Path | None = None
+        try:
+            html_path = speaking.build_exercise_html(exercise)
+            await bot.send_document(
+                user_id,
+                document=FSInputFile(
+                    html_path, filename=speaking.handout_filename(language, native)
+                ),
+                caption="📘 Теория: слова, таблицы форм и подсказки по построению фразы.",
+            )
+        except Exception:
+            log.exception("Failed to send exercise for user %s", user_id)
+            await bot.send_message(user_id, "Не удалось отправить упражнение. Попробуй ещё раз.")
+            return
+        finally:
+            if html_path and html_path.exists():
+                html_path.unlink(missing_ok=True)
+
+        await bot.send_message(
             user_id,
-            document=FSInputFile(html_path),
-            caption="Открой файл и запиши голосовое сообщение с переводом 🎙",
+            "🎙 Переведи и запиши голосовое:\n\n"
+            f"<b>{html.escape(exercise['source_sentence'])}</b>",
         )
-    except Exception:
-        log.exception("Failed to send exercise for user %s", user_id)
-        await bot.send_message(user_id, "Не удалось отправить упражнение. Попробуй ещё раз.")
-        return
-    finally:
-        if html_path and html_path.exists():
-            html_path.unlink(missing_ok=True)
 
-    _active_exercises[user_id] = {
-        "source_sentence": exercise["source_sentence"],
-        "language": language,
-        "native_language": native,
-    }
+        _active_exercises[user_id] = {
+            "source_sentence": exercise["source_sentence"],
+            "language": language,
+            "native_language": native,
+        }
+    finally:
+        _generating_exercises.discard(user_id)
+        try:
+            await bot.delete_message(user_id, status.message_id)
+        except TelegramBadRequest:
+            pass
 
 
 @router.callback_query(F.data.startswith(f"{PRACTICE_CALLBACK}:"))
@@ -555,6 +587,11 @@ async def on_practice_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     await callback.answer()
+    # Drop the button so the exercise cannot be requested twice from one patch.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except (TelegramBadRequest, AttributeError):
+        pass
     await _start_practice(callback.from_user.id, bot, context=content["transcript"])
 
 
@@ -578,28 +615,26 @@ async def on_voice(message: Message, bot: Bot) -> None:
     if not exercise:
         return
 
-    audio_path: Path | None = None
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        audio_path = Path(tmp.name)
     try:
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            await bot.download(message.voice, destination=tmp.name)
-            audio_path = Path(tmp.name)
-    except Exception:
-        log.exception("Failed to download voice from user %s", user_id)
-        await message.answer("Не удалось скачать голосовое. Попробуй ещё раз.")
-        return
-    finally:
-        if audio_path and audio_path.exists():
-            audio_path.unlink(missing_ok=True)
+        try:
+            await bot.download(message.voice, destination=audio_path)
+        except Exception:
+            log.exception("Failed to download voice from user %s", user_id)
+            await message.answer("Не удалось скачать голосовое. Попробуй ещё раз.")
+            return
 
-    text: str | None = None
-    try:
-        text = await asyncio.to_thread(
-            speaking.transcribe_voice, audio_path, exercise["language"]
-        )
-    except Exception:
-        log.exception("STT failed for user %s", user_id)
-        await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
-        return
+        try:
+            text = await asyncio.to_thread(
+                speaking.transcribe_voice, audio_path, exercise["language"]
+            )
+        except Exception:
+            log.exception("STT failed for user %s", user_id)
+            await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
+            return
+    finally:
+        audio_path.unlink(missing_ok=True)
 
     if not text:
         await message.answer("Я ничего не услышал. Попробуй ещё раз.")
