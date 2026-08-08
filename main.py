@@ -540,6 +540,26 @@ async def _send_task(
         return message, False
 
 
+async def _send_notes(user_id: int, bot: Bot, notes: dict[str, Any], native: str) -> None:
+    """Send notes the teacher wrote mid-conversation as their own message."""
+    try:
+        await bot(
+            SendRichMessage(
+                chat_id=user_id,
+                rich_message=InputRichMessage(
+                    html=speaking.build_notes_rich_html(notes, native),
+                    skip_entity_detection=True,
+                ),
+            )
+        )
+        return
+    except TelegramBadRequest:
+        log.warning("Rich notes rejected for user %s; sending plain formatting.", user_id)
+    fallback = speaking.build_notes_fallback_html(notes, native)
+    if fallback:
+        await bot.send_message(user_id, fallback, disable_web_page_preview=True)
+
+
 async def _attach_theory(
     user_id: int, bot: Bot, message_id: int, exercise: dict[str, Any], rich: bool
 ) -> None:
@@ -646,6 +666,14 @@ async def _start_practice(
             await _attach_theory(user_id, bot, task_message.message_id, exercise, rich)
         except Exception:
             log.exception("Failed to attach theory for user %s", user_id)
+
+        # The notes are a turn of the conversation: the same teacher reads them
+        # back later and answers in the light of what they themselves taught.
+        notes_text = speaking.notes_to_text(exercise)
+        if notes_text:
+            db.append_exercise_turns(
+                user_id, [{"role": "tutor", "kind": "notes", "text": notes_text}]
+            )
     finally:
         _generating_exercises.discard(user_id)
 
@@ -715,6 +743,7 @@ async def _replace(status: Message | None, message: Message, text: str) -> None:
 
 async def _reply_in_session(
     message: Message,
+    bot: Bot,
     status: Message | None,
     exercise: dict[str, Any],
     text: str,
@@ -746,13 +775,16 @@ async def _reply_in_session(
         await _replace(status, message, "Не удалось ответить. Попробуй ещё раз.")
         return
 
-    db.append_exercise_turns(
-        user_id,
-        [
-            {"role": "learner", "kind": kind, "text": text},
-            {"role": "tutor", "kind": "text", "text": result["reply"]},
-        ],
-    )
+    turns_to_store = [
+        {"role": "learner", "kind": kind, "text": text},
+        {"role": "tutor", "kind": "text", "text": result["reply"]},
+    ]
+    notes = result.get("notes") or {}
+    notes_text = speaking.notes_to_text(notes, native) if notes.get("blocks") else ""
+    if notes_text:
+        turns_to_store.append({"role": "tutor", "kind": "notes", "text": notes_text})
+    db.append_exercise_turns(user_id, turns_to_store)
+
     await _replace(
         status,
         message,
@@ -760,6 +792,11 @@ async def _reply_in_session(
             result, native, transcription=text if kind == "voice" else None
         ),
     )
+    if notes_text:
+        try:
+            await _send_notes(user_id, bot, notes, native)
+        except Exception:
+            log.exception("Failed to send follow-up notes for user %s", user_id)
 
 
 @router.message(F.voice)
@@ -823,7 +860,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
         await _replace(status, message, "Я ничего не услышал. Попробуй ещё раз.")
         return
 
-    await _reply_in_session(message, status, exercise, text, "voice")
+    await _reply_in_session(message, bot, status, exercise, text, "voice")
 
 
 # --------------------------------------------------------------------------- #
@@ -993,7 +1030,7 @@ async def on_text(message: Message, bot: Bot) -> None:
     if not user.get("awaiting_time"):
         exercise = db.get_active_exercise(message.from_user.id)
         if exercise:
-            await _reply_in_session(message, None, exercise, message.text, "text")
+            await _reply_in_session(message, bot, None, exercise, message.text, "text")
         return
     parsed = _parse_time(message.text)
     if parsed is None:
