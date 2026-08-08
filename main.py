@@ -23,7 +23,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.methods import SendRichMessage
+from aiogram.methods import EditMessageText, SendRichMessage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -497,7 +497,6 @@ async def on_patch_button(message: Message, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Speaking practice
 # --------------------------------------------------------------------------- #
-GENERATING_TEXT = "⏳ Придумываю упражнение и готовлю теорию — минутку…"
 ALREADY_GENERATING_TEXT = "Упражнение уже готовится, подожди немного 🙏"
 MAX_VOICE_DURATION_SECONDS = 60
 
@@ -515,25 +514,63 @@ def _patch_vocabulary(content: dict[str, Any]) -> list[str]:
     ]
 
 
-async def _send_theory(user_id: int, bot: Bot, exercise: dict[str, Any]) -> None:
-    """Send the theory as a rich message with collapsible hint sections."""
+async def _send_task(
+    user_id: int, bot: Bot, source_sentence: str, native: str
+) -> tuple[Message, bool]:
+    """Send the task, preferring a rich message so theory can be folded in later.
+
+    Returns the sent message and whether it is a rich one.
+    """
     try:
-        await bot(
+        message = await bot(
             SendRichMessage(
                 chat_id=user_id,
                 rich_message=InputRichMessage(
-                    html=speaking.build_exercise_rich_html(exercise),
+                    html=speaking.build_task_rich_html(source_sentence, native),
                     skip_entity_detection=True,
                 ),
             )
         )
+        return message, True
     except TelegramBadRequest:
-        log.warning("Rich theory rejected for user %s; sending plain formatting.", user_id)
-        await bot.send_message(
+        log.warning("Rich task rejected for user %s; sending plain formatting.", user_id)
+        message = await bot.send_message(
             user_id,
-            speaking.build_exercise_fallback_html(exercise),
+            speaking.build_task_fallback_html(source_sentence, native),
             disable_web_page_preview=True,
         )
+        return message, False
+
+
+async def _attach_theory(
+    user_id: int, bot: Bot, message_id: int, exercise: dict[str, Any], rich: bool
+) -> None:
+    """Fold the theory into the task message, keeping its collapsible sections."""
+    if rich:
+        try:
+            await bot(
+                EditMessageText(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    rich_message=InputRichMessage(
+                        html=speaking.build_exercise_rich_html(exercise),
+                        skip_entity_detection=True,
+                    ),
+                )
+            )
+            return
+        except TelegramBadRequest:
+            log.warning("Rich theory edit rejected for user %s; sending plain.", user_id)
+    fallback = speaking.build_exercise_fallback_html(exercise)
+    try:
+        await bot.edit_message_text(
+            fallback,
+            chat_id=user_id,
+            message_id=message_id,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await bot.send_message(user_id, fallback, disable_web_page_preview=True)
 
 
 async def _start_practice(
@@ -541,8 +578,9 @@ async def _start_practice(
 ) -> None:
     """Generate and send a speaking exercise.
 
-    Generation takes a while, so the user gets an immediate status message and
-    repeated taps are ignored until the current exercise is ready.
+    The sentence is generated first and sent right away, so the learner can
+    start working while the theory is written; the theory then replaces the
+    task message. Repeated taps are ignored until the exercise is ready.
     """
     if user_id in _generating_exercises:
         await bot.send_message(user_id, ALREADY_GENERATING_TEXT)
@@ -559,47 +597,60 @@ async def _start_practice(
     difficulty = user.get("difficulty")
 
     _generating_exercises.add(user_id)
-    status = await bot.send_message(user_id, GENERATING_TEXT)
     try:
         try:
-            exercise = await asyncio.to_thread(
-                speaking.generate_exercise, language, native, difficulty, vocabulary_hint
+            source_sentence = await asyncio.to_thread(
+                speaking.generate_sentence, language, native, difficulty, vocabulary_hint
             )
         except Exception:
             log.exception("Failed to generate exercise for user %s", user_id)
             await bot.send_message(user_id, "Не удалось придумать упражнение. Попробуй ещё раз позже.")
             return
 
-        if not exercise.get("source_sentence"):
+        if not source_sentence:
             await bot.send_message(user_id, "Не удалось придумать предложение. Попробуй ещё раз.")
             return
 
         try:
-            await _send_theory(user_id, bot, exercise)
+            task_message, rich = await _send_task(user_id, bot, source_sentence, native)
         except Exception:
             log.exception("Failed to send exercise for user %s", user_id)
             await bot.send_message(user_id, "Не удалось отправить упражнение. Попробуй ещё раз.")
             return
 
-        await bot.send_message(
-            user_id,
-            "🎙 Переведи и запиши голосовое до 1 минуты:\n\n"
-            f"<b>{html.escape(exercise['source_sentence'])}</b>",
-        )
-
+        # The answer is accepted from now on, theory or not.
         exercise_state = {
-            "source_sentence": exercise["source_sentence"],
+            "source_sentence": source_sentence,
             "language": language,
             "native_language": native,
         }
         db.set_active_exercise(user_id, **exercise_state)
         _active_exercises[user_id] = exercise_state
+
+        status = await bot.send_message(user_id, speaking.hints_pending_text(native))
+        try:
+            exercise = await asyncio.to_thread(
+                speaking.generate_theory, language, native, source_sentence, difficulty
+            )
+        except Exception:
+            log.exception("Failed to generate theory for user %s", user_id)
+            await bot.send_message(
+                user_id,
+                "Не удалось подготовить подсказки, но задание в силе — запиши ответ 🎙",
+            )
+            return
+        finally:
+            try:
+                await bot.delete_message(user_id, status.message_id)
+            except TelegramBadRequest:
+                pass
+
+        try:
+            await _attach_theory(user_id, bot, task_message.message_id, exercise, rich)
+        except Exception:
+            log.exception("Failed to attach theory for user %s", user_id)
     finally:
         _generating_exercises.discard(user_id)
-        try:
-            await bot.delete_message(user_id, status.message_id)
-        except TelegramBadRequest:
-            pass
 
 
 @router.callback_query(F.data.startswith(f"{PRACTICE_CALLBACK}:"))

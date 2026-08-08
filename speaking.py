@@ -1,8 +1,9 @@
 """Speaking exercise: generate a practice sentence plus theory,
 transcribe the learner's voice, and evaluate the translation.
 
-The sentence to translate is shown in Telegram. The theory is a rich message:
-the vocabulary table is visible right away and every other hint — each grammar
+The sentence is generated on its own so the learner gets the task immediately;
+the theory is generated afterwards and folded into the same rich message. The
+vocabulary table is visible right away and every other hint — each grammar
 table, the key phrases, the word-order notes — sits in its own collapsible
 block. It is a pure textbook chapter and never contains the answer.
 """
@@ -41,13 +42,19 @@ class STTConfigurationError(STTError):
     """Speech-to-text credentials are missing or rejected."""
 
 
-_EXERCISE_SYSTEM = (
+_SENTENCE_SYSTEM = (
+    "You are a bilingual language teacher. You invent ONE sentence for a speaking exercise: "
+    "it is written in the learner's NATIVE language and the learner will say it aloud in the "
+    "target language. Keep it natural, everyday and appropriate to the level, one sentence "
+    "only. NEVER write the target-language translation.\n"
+    'Respond ONLY with JSON: {"source_sentence": "..."}'
+)
+
+_THEORY_SYSTEM = (
     "You are a bilingual language teacher who speaks both the learner's native language "
-    "and the target language. You produce ONE speaking exercise plus the theory the learner "
-    "needs to build the sentence themselves.\n"
+    "and the target language. Given a source sentence in the learner's native language, you "
+    "produce the theory the learner needs to say it in the target language themselves.\n"
     "Rules:\n"
-    "- The source sentence is written in the NATIVE language; the learner will say it aloud "
-    "in the target language. Keep it natural and appropriate to the level.\n"
     "- All explanations, notes and table headers are written in the NATIVE language; example "
     "forms are in the target language. Use a warm, conversational Duolingo Guidebook tone, "
     "with playful short tip titles.\n"
@@ -81,8 +88,7 @@ _EXERCISE_SYSTEM = (
     "- Keep the theory concise: no more than 8 vocabulary items, 4 grammar tables, "
     "12 rows per table, 5 key phrases, and 4 notes; keep each cell near 200 characters.\n"
     "Respond ONLY with JSON:\n"
-    '{"source_sentence": "...", '
-    '"vocabulary": [{"word": "<target-language dictionary form>", '
+    '{"vocabulary": [{"word": "<target-language dictionary form>", '
     '"translation": "<native-language meaning>", '
     '"note": "grammatical info, e.g. verb, 2nd conjugation / noun, feminine"}], '
     '"grammar": [{"title": "...", "explanation": "...", '
@@ -111,6 +117,11 @@ _LABELS: dict[str, dict[str, str]] = {
     "rus": {
         "title": "Теория",
         "task": "Задание",
+        "task_intro": (
+            "Попрактикуемся! Переведи следующее предложение и отправь его "
+            "голосовым сообщением:"
+        ),
+        "hints_pending": "Готовлю подсказки...",
         "vocabulary": "Слова",
         "grammar": "Грамматика",
         "key_phrases": "Полезные фразы",
@@ -120,6 +131,11 @@ _LABELS: dict[str, dict[str, str]] = {
     "eng": {
         "title": "Theory",
         "task": "Task",
+        "task_intro": (
+            "Let's practice! Translate the following sentence and send it as a "
+            "voice message:"
+        ),
+        "hints_pending": "Preparing hints...",
         "vocabulary": "Vocabulary",
         "grammar": "Grammar",
         "key_phrases": "Key phrases",
@@ -129,6 +145,11 @@ _LABELS: dict[str, dict[str, str]] = {
     "ukr": {
         "title": "Теорія",
         "task": "Завдання",
+        "task_intro": (
+            "Попрактикуємось! Перекладіть наступне речення та надішліть його "
+            "голосовим повідомленням:"
+        ),
+        "hints_pending": "Готую підказки...",
         "vocabulary": "Слова",
         "grammar": "Граматика",
         "key_phrases": "Корисні фрази",
@@ -228,14 +249,17 @@ def _key_phrase(item: object) -> dict[str, str] | None:
     return {"target": target, "native": native}
 
 
-def generate_exercise(
+def generate_sentence(
     language: str,
     native_language: str,
     difficulty: str | None = None,
     vocabulary_hint: list[str] | None = None,
     client: OpenAI | None = None,
-) -> dict:
-    """Generate a speaking exercise: source sentence + theory.
+) -> str:
+    """Generate only the sentence to translate.
+
+    Kept separate from the theory so the learner can start working on the task
+    while the (much slower) theory is still being written.
 
     ``vocabulary_hint`` carries a few words from a patch the learner just heard
     so the exercise can reuse them. The patch text itself is never passed in:
@@ -250,8 +274,8 @@ def generate_exercise(
         f"Target language: {target_name} ({language})",
         f"Native language: {native_name} ({native_language})",
         f"Level: {difficulty or 'mixed'}",
+        f"Theme: {random.choice(THEMES)}",
     ]
-    parts.append(f"Theme: {random.choice(THEMES)}")
     words = [word for word in (vocabulary_hint or []) if word.strip()][:MAX_VOCABULARY_ITEMS]
     if words:
         parts.append(
@@ -259,16 +283,52 @@ def generate_exercise(
             "sentence about the theme above: " + ", ".join(words)
         )
     parts.append(
-        f"Generate the source sentence in {native_name} and the theory needed to translate it "
-        f"into {target_name}: {target_name} vocabulary in dictionary form with its {native_name} "
-        "meaning, full conjugation/declension tables for the forms involved, and short notes on "
-        "word order. Do not reveal the translated sentence."
+        f"Write the source sentence in {native_name}; the learner will translate it into "
+        f"{target_name}."
     )
 
     resp = client.chat.completions.create(
         model=settings.openai_exercise_model,
         messages=[
-            {"role": "system", "content": _EXERCISE_SYSTEM},
+            {"role": "system", "content": _SENTENCE_SYSTEM},
+            {"role": "user", "content": "\n".join(parts)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.8,
+    )
+    payload = json.loads(resp.choices[0].message.content or "{}")
+    return _clip(payload.get("source_sentence", ""))
+
+
+def generate_theory(
+    language: str,
+    native_language: str,
+    source_sentence: str,
+    difficulty: str | None = None,
+    client: OpenAI | None = None,
+) -> dict:
+    """Generate the theory needed to translate ``source_sentence``."""
+    client = _client(client)
+    target_name = _target_name(language)
+    native_name = _native_name(native_language)
+
+    parts = [
+        f"Target language: {target_name} ({language})",
+        f"Native language: {native_name} ({native_language})",
+        f"Level: {difficulty or 'mixed'}",
+        f"Source sentence ({native_name}): {source_sentence}",
+        (
+            f"Give the theory needed to translate it into {target_name}: {target_name} "
+            f"vocabulary in dictionary form with its {native_name} meaning, full "
+            "conjugation/declension tables for the forms involved, and short notes on word "
+            "order. Do not reveal the translated sentence."
+        ),
+    ]
+
+    resp = client.chat.completions.create(
+        model=settings.openai_exercise_model,
+        messages=[
+            {"role": "system", "content": _THEORY_SYSTEM},
             {"role": "user", "content": "\n".join(parts)},
         ],
         response_format={"type": "json_object"},
@@ -290,7 +350,7 @@ def generate_exercise(
         if (phrase := _key_phrase(item)) is not None
     ]
     return {
-        "source_sentence": _clip(payload.get("source_sentence", "")),
+        "source_sentence": _clip(source_sentence),
         "vocabulary": [
             {
                 "word": _clip(item.get("word", "")),
@@ -382,8 +442,35 @@ def _notes_section(exercise: dict, labels: dict[str, str]) -> str:
     return _details(escape(labels["notes"]), f"<ul>{items}</ul>")
 
 
+def hints_pending_text(native_language: str) -> str:
+    """Placeholder shown while the theory is still being generated."""
+    return _labels(native_language)["hints_pending"]
+
+
+def _task_block(source_sentence: str, labels: dict[str, str]) -> str:
+    return (
+        f"<p>{escape(labels['task_intro'])}</p>"
+        f"<p><i>{escape(source_sentence)}</i></p>"
+    )
+
+
+def build_task_rich_html(source_sentence: str, native_language: str) -> str:
+    """Render just the task as rich-message HTML.
+
+    Sent as a rich message from the start so the theory can be folded into the
+    very same message once it is ready.
+    """
+    return _task_block(source_sentence, _labels(native_language))
+
+
+def build_task_fallback_html(source_sentence: str, native_language: str) -> str:
+    """Render just the task with classic message formatting."""
+    labels = _labels(native_language)
+    return f"{escape(labels['task_intro'])}\n\n<i>{escape(source_sentence)}</i>"
+
+
 def build_exercise_rich_html(exercise: dict) -> str:
-    """Render the theory as rich-message HTML for ``sendRichMessage``.
+    """Render the task plus theory as rich-message HTML for ``sendRichMessage``.
 
     The vocabulary table is expanded; every other hint is a separate
     ``<details>`` block the learner can open on its own.
@@ -394,7 +481,10 @@ def build_exercise_rich_html(exercise: dict) -> str:
     native_name = _native_name(native_language)
     labels = _labels(native_language)
 
-    header = f"<h2>📘 {escape(target_name)} — {escape(labels['title'])}</h2>"
+    header = (
+        _task_block(exercise.get("source_sentence", ""), labels)
+        + f"<h2>📘 {escape(labels['title'])}</h2>"
+    )
     sections = [
         _vocabulary_section(exercise, labels),
         *_grammar_sections(exercise, labels),
@@ -412,17 +502,20 @@ def build_exercise_rich_html(exercise: dict) -> str:
 
 
 def build_exercise_fallback_html(exercise: dict) -> str:
-    """Render the theory with classic message formatting.
+    """Render the task plus theory with classic message formatting.
 
     Used when the rich message is rejected: no tables or per-section
     collapsing, but every block after the vocabulary is an expandable
     blockquote, so the message still stays short.
     """
-    language = exercise["language"]
-    target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
     labels = _labels(exercise["native_language"])
 
-    lines = [f"📘 <b>{escape(target_name)} — {escape(labels['title'])}</b>"]
+    lines = [
+        build_task_fallback_html(
+            exercise.get("source_sentence", ""), exercise["native_language"]
+        ),
+        f"\n📘 <b>{escape(labels['title'])}</b>",
+    ]
     vocabulary = exercise.get("vocabulary", [])
     if vocabulary:
         lines.append(f"\n<b>{escape(labels['vocabulary'])}</b>")
