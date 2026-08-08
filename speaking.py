@@ -25,6 +25,14 @@ from languages import ENGLISH_NAMES, ISO_639_1, LANGUAGES, NATIVE_NAMES
 
 log = logging.getLogger(__name__)
 
+MAX_VOCABULARY_ITEMS = 8
+MAX_GRAMMAR_TABLES = 4
+MAX_ROWS_PER_TABLE = 12
+MAX_KEY_PHRASES = 5
+MAX_NOTES = 4
+MAX_CELL_CHARS = 200
+MAX_HTML_BYTES = 100_000
+
 
 class STTError(RuntimeError):
     """Speech-to-text service failed after the request was attempted."""
@@ -71,6 +79,8 @@ _EXERCISE_SYSTEM = (
     "- In 'vocabulary', 'word' is the TARGET-language dictionary form and 'translation' is its "
     "native-language meaning — never the other way round.\n"
     "- 'notes' explains word order and how the pieces combine (2-4 short items).\n"
+    "- Keep the handout concise: no more than 8 vocabulary items, 4 grammar tables, "
+    "12 rows per table, 5 key phrases, and 4 notes; keep each cell near 200 characters.\n"
     "Respond ONLY with JSON:\n"
     '{"source_sentence": "...", '
     '"vocabulary": [{"word": "<target-language dictionary form>", '
@@ -150,6 +160,18 @@ def _labels(native_language: str) -> dict[str, str]:
     return _LABELS.get(native_language, _LABELS["eng"])
 
 
+def _clip(value: object) -> str:
+    text = str(value).strip()
+    if len(text) <= MAX_CELL_CHARS:
+        return text
+    return text[: MAX_CELL_CHARS - 1].rstrip() + "…"
+
+
+def _bounded_list(value: object, limit: int) -> list:
+    """Return at most ``limit`` items, or an empty list for malformed payloads."""
+    return value[:limit] if isinstance(value, list) else []
+
+
 def _table(item: object) -> dict:
     """Normalise one grammar table, dropping rows that do not fit the headers."""
     if not isinstance(item, dict):
@@ -161,10 +183,10 @@ def _table(item: object) -> dict:
             "notice": "",
             "example": {"target": "", "native": ""},
         }
-    title = str(item.get("title", "")).strip()
+    title = _clip(item.get("title", ""))
     raw_headers = item.get("headers", [])
     headers = (
-        [str(cell).strip() for cell in raw_headers if str(cell).strip()]
+        [_clip(cell) for cell in raw_headers if str(cell).strip()]
         if isinstance(raw_headers, list)
         else []
     )
@@ -172,10 +194,10 @@ def _table(item: object) -> dict:
         headers = []
     rows: list[list[str]] = []
     raw_rows = item.get("rows", [])
-    for row in raw_rows if isinstance(raw_rows, list) else []:
+    for row in (raw_rows if isinstance(raw_rows, list) else [])[:MAX_ROWS_PER_TABLE]:
         if not isinstance(row, list):
             continue
-        cells = [str(cell).strip() for cell in row]
+        cells = [_clip(cell) for cell in row]
         if not any(cells):
             continue
         if headers:
@@ -183,10 +205,10 @@ def _table(item: object) -> dict:
         rows.append(cells)
     return {
         "title": title,
-        "explanation": str(item.get("explanation", "")).strip(),
+        "explanation": _clip(item.get("explanation", "")),
         "headers": headers,
         "rows": rows,
-        "notice": str(item.get("notice", "")).strip(),
+        "notice": _clip(item.get("notice", "")),
         "example": _example(item.get("example")),
     }
 
@@ -195,16 +217,16 @@ def _example(item: object) -> dict[str, str]:
     if not isinstance(item, dict):
         return {"target": "", "native": ""}
     return {
-        "target": str(item.get("target", "")).strip(),
-        "native": str(item.get("native", "")).strip(),
+        "target": _clip(item.get("target", "")),
+        "native": _clip(item.get("native", "")),
     }
 
 
 def _key_phrase(item: object) -> dict[str, str] | None:
     if not isinstance(item, dict):
         return None
-    target = str(item.get("target", "")).strip()
-    native = str(item.get("native", "")).strip()
+    target = _clip(item.get("target", ""))
+    native = _clip(item.get("native", ""))
     if not target or not native:
         return None
     return {"target": target, "native": native}
@@ -242,7 +264,7 @@ def generate_exercise(
     )
 
     resp = client.chat.completions.create(
-        model=settings.openai_model,
+        model=settings.openai_exercise_model,
         messages=[
             {"role": "system", "content": _EXERCISE_SYSTEM},
             {"role": "user", "content": "\n".join(parts)},
@@ -251,30 +273,34 @@ def generate_exercise(
         temperature=0.8,
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
+    vocabulary_items = _bounded_list(payload.get("vocabulary"), MAX_VOCABULARY_ITEMS)
+    grammar_items = _bounded_list(payload.get("grammar"), MAX_GRAMMAR_TABLES)
+    phrase_items = _bounded_list(payload.get("key_phrases"), MAX_KEY_PHRASES)
+    note_items = _bounded_list(payload.get("notes"), MAX_NOTES)
     grammar = [
         _table(item)
-        for item in payload.get("grammar", [])
+        for item in grammar_items
         if isinstance(item, dict)
     ]
     key_phrases = [
         phrase
-        for item in payload.get("key_phrases", [])
+        for item in phrase_items
         if (phrase := _key_phrase(item)) is not None
     ]
     return {
-        "source_sentence": str(payload.get("source_sentence", "")).strip(),
+        "source_sentence": _clip(payload.get("source_sentence", "")),
         "vocabulary": [
             {
-                "word": str(item.get("word", "")).strip(),
-                "translation": str(item.get("translation", "")).strip(),
-                "note": str(item.get("note", "")).strip(),
+                "word": _clip(item.get("word", "")),
+                "translation": _clip(item.get("translation", "")),
+                "note": _clip(item.get("note", "")),
             }
-            for item in payload.get("vocabulary", [])
+            for item in vocabulary_items
             if isinstance(item, dict) and str(item.get("word", "")).strip()
         ],
         "grammar": [table for table in grammar if table["rows"]],
         "key_phrases": key_phrases,
-        "notes": [str(note).strip() for note in payload.get("notes", []) if str(note).strip()],
+        "notes": [_clip(note) for note in note_items if str(note).strip()],
         "language": language,
         "native_language": native_language,
     }
@@ -379,7 +405,8 @@ def build_exercise_html(exercise: dict) -> Path:
         else ""
     )
 
-    html = f"""<!DOCTYPE html>
+    def _render(phrases: str, notes_section: str) -> str:
+        return f"""<!DOCTYPE html>
 <html lang="{escape(native_language)}">
 <head>
 <meta charset="utf-8">
@@ -403,10 +430,17 @@ th {{ background: #222; }}
 <h1>{escape(target_name)} — {escape(labels['title'])}</h1>
 {vocab_html}
 {grammar_html}
-{phrases_html}
-{notes_html}
+{phrases}
+{notes_section}
 </body>
 </html>"""
+    html = _render(phrases_html, notes_html)
+    if len(html.encode("utf-8")) > MAX_HTML_BYTES:
+        log.warning("Practice handout exceeded %d bytes; dropping key phrases.", MAX_HTML_BYTES)
+        html = _render("", notes_html)
+    if len(html.encode("utf-8")) > MAX_HTML_BYTES:
+        log.warning("Practice handout still exceeded %d bytes; dropping notes.", MAX_HTML_BYTES)
+        html = _render("", "")
     path.write_text(html, encoding="utf-8")
     return path
 
@@ -417,8 +451,12 @@ def transcribe_voice(audio_path: Path, language: str) -> str | None:
     Returns the transcribed text, or None when the model returns empty text.
     Raises on API errors so the caller can decide what to tell the user.
     """
-    if not settings.elevenlabs_stt_api_key:
-        raise STTConfigurationError("ELEVENLABS_STT_API_KEY is not set.")
+    api_key = settings.elevenlabs_stt_api_key or settings.elevenlabs_api_key
+    key_source = "dedicated STT key" if settings.elevenlabs_stt_api_key else "main ElevenLabs key"
+    if not api_key:
+        raise STTConfigurationError(
+            "Neither ELEVENLABS_STT_API_KEY nor ELEVENLABS_API_KEY is set."
+        )
 
     code = ISO_639_1.get(language)
     data: dict[str, str] = {"model_id": "scribe_v1"}
@@ -429,14 +467,21 @@ def transcribe_voice(audio_path: Path, language: str) -> str | None:
     with httpx.Client(timeout=120) as client, audio_path.open("rb") as f:
         resp = client.post(
             url,
-            headers={"xi-api-key": settings.elevenlabs_stt_api_key},
+            headers={"xi-api-key": api_key},
             data=data,
             files={"file": (audio_path.name, f, "audio/ogg")},
         )
     if resp.status_code != 200:
         snippet = resp.text[:200].replace("\n", " ")
-        log.warning("STT failed (status=%s): %s", resp.status_code, snippet)
-        error = f"STT failed (status={resp.status_code}): {snippet}"
+        log.warning("STT failed using %s (status=%s): %s", key_source, resp.status_code, snippet)
+        if "missing_permissions" in snippet.lower() or "speech_to_text" in snippet.lower():
+            error = (
+                f"STT failed using {key_source} (status={resp.status_code}): "
+                "the ElevenLabs key lacks the speech_to_text permission. "
+                f"{snippet}"
+            )
+        else:
+            error = f"STT failed using {key_source} (status={resp.status_code}): {snippet}"
         if resp.status_code in (401, 403):
             raise STTConfigurationError(error)
         raise STTError(error)
@@ -462,7 +507,7 @@ def evaluate_translation(
         transcription=transcription,
     )
     resp = client.chat.completions.create(
-        model=settings.openai_model,
+        model=settings.openai_exercise_model,
         messages=[{"role": "system", "content": system}],
         response_format={"type": "json_object"},
         temperature=0.3,
