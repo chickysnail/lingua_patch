@@ -1,5 +1,9 @@
-"""Speaking exercise: generate a practice sentence plus theory,
-transcribe the learner's voice, and evaluate the translation.
+"""Speaking exercise: generate a practice sentence plus theory, transcribe the
+learner's voice, and talk them through the exercise.
+
+Once the task is sent, every learner turn — spoken (the normal way) or typed —
+is answered in the context of the whole session by a bilingual speaker who
+never leaves the topic of language learning.
 
 The sentence is generated on its own so the learner gets the task immediately;
 the theory is generated afterwards and folded into the same rich message. The
@@ -99,17 +103,42 @@ _THEORY_SYSTEM = (
     '"notes": ["..."]}'
 )
 
-_EVAL_TEMPLATE = (
-    "You evaluate a language learner's spoken translation. "
-    "The learner was asked to translate the following source sentence from {native_name} to {target_name}:\n"
+MAX_HISTORY_TURNS = 20
+VERDICTS = ("correct", "almost", "incorrect", "none")
+
+_CHAT_TEMPLATE = (
+    "You are a person who grew up speaking both {native_name} and {target_name} and you are "
+    "sitting next to a learner during ONE speaking exercise. You were the one who set the "
+    "task: say this {native_name} sentence out loud in {target_name}:\n"
     '"{source_sentence}"\n\n'
-    "Their transcribed spoken answer is:\n"
-    '"{transcription}"\n\n'
-    "Is the answer a correct translation? Be somewhat lenient about minor grammar or word-choice issues. "
-    "Do not be strict about punctuation. "
-    'Respond ONLY with JSON: '
-    '{{"status": "Correct" | "Incorrect" | "Almost correct", '
-    '"feedback": "short suggestions in {native_name}"}}'
+    "You see the whole conversation of this exercise. Every learner turn is labelled: "
+    "[voice] is a speech-to-text transcript of what they said out loud — expect small "
+    "recognition artefacts (missing punctuation, a homophone, a swallowed ending) and never "
+    "build a correction on something that is obviously just misheard; [text] is typed, may be "
+    "in any language and is often a question rather than an attempt.\n"
+    "Decide what the latest turn is and answer accordingly:\n"
+    "- An attempt at the exercise: reply the way a bilingual friend actually would. If it was "
+    "right, confirm it warmly and, if useful, add one natural-sounding alternative. If it was "
+    "not, say the whole natural {target_name} sentence they were reaching for, then explain in "
+    "at most two short sentences WHY, in terms of meaning or a rule "
+    "(\"'gostar' always carries 'de' before what you like\"). "
+    "NEVER produce a list of mechanical edit operations such as \"add X after Y, use Z "
+    "instead of W, remove V\" — that reads like a puzzle instead of speech. Do not enumerate "
+    "every deviation: give the correct sentence and the one or two things worth remembering.\n"
+    "- A question about the exercise, the language, a word, grammar or pronunciation: answer "
+    "it plainly and briefly, then invite them to try the sentence again if they have not "
+    "said it correctly yet.\n"
+    "- Anything that is not language learning (small talk, personal advice, news, code, "
+    "requests to be a general assistant): decline in one friendly sentence and bring them "
+    "back to the exercise. You only ever talk about learning {target_name}.\n"
+    "Style: write in {native_name}; only examples and corrected sentences are in "
+    "{target_name}. Address the learner informally. Keep it under 60 words, plain sentences, "
+    "no bullet lists, no headings, no emoji spam. When you invite another attempt, invite "
+    "them to SAY it out loud — never suggest writing or typing it.\n"
+    'Respond ONLY with JSON: {{"verdict": "correct" | "almost" | "incorrect" | "none", '
+    '"reply": "your answer in {native_name}"}} '
+    'where "verdict" describes the latest attempt and is "none" when the latest turn is not '
+    "an attempt."
 )
 
 # Section headings per native language.
@@ -127,6 +156,10 @@ _LABELS: dict[str, dict[str, str]] = {
         "key_phrases": "Полезные фразы",
         "notice": "Обрати внимание",
         "notes": "Как собрать фразу",
+        "heard": "Вот что я услышал:",
+        "correct": "✅ Верно",
+        "almost": "🟡 Почти",
+        "incorrect": "🔴 Не совсем",
     },
     "eng": {
         "title": "Theory",
@@ -141,6 +174,10 @@ _LABELS: dict[str, dict[str, str]] = {
         "key_phrases": "Key phrases",
         "notice": "Notice",
         "notes": "Putting it together",
+        "heard": "Here's what I heard:",
+        "correct": "✅ Correct",
+        "almost": "🟡 Almost",
+        "incorrect": "🔴 Not quite",
     },
     "ukr": {
         "title": "Теорія",
@@ -155,6 +192,10 @@ _LABELS: dict[str, dict[str, str]] = {
         "key_phrases": "Корисні фрази",
         "notice": "Зверни увагу",
         "notes": "Як скласти фразу",
+        "heard": "Ось що я почув:",
+        "correct": "✅ Правильно",
+        "almost": "🟡 Майже",
+        "incorrect": "🔴 Не зовсім",
     },
 }
 
@@ -556,8 +597,12 @@ def build_exercise_fallback_html(exercise: dict) -> str:
     return "\n".join(lines)
 
 
-def transcribe_voice(audio_path: Path, language: str) -> str | None:
+def transcribe_voice(audio_path: Path, language: str | None = None) -> str | None:
     """Transcribe a voice file using ElevenLabs Scribe.
+
+    ``language`` is only a hint; leave it out to let Scribe detect the language,
+    which matters because a learner speaks the target language when attempting
+    the exercise but their native one when asking about it.
 
     Returns the transcribed text, or None when the model returns empty text.
     Raises on API errors so the caller can decide what to tell the user.
@@ -569,8 +614,8 @@ def transcribe_voice(audio_path: Path, language: str) -> str | None:
             "Neither ELEVENLABS_STT_API_KEY nor ELEVENLABS_API_KEY is set."
         )
 
-    code = ISO_639_1.get(language)
     data: dict[str, str] = {"model_id": "scribe_v1"}
+    code = ISO_639_1.get(language) if language else None
     if code:
         data["language_code"] = code
 
@@ -602,43 +647,72 @@ def transcribe_voice(audio_path: Path, language: str) -> str | None:
     return text if text else None
 
 
-def evaluate_translation(
+def _chat_messages(system: str, turns: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Turn the stored conversation into OpenAI chat messages.
+
+    Learner turns keep their ``[voice]``/``[text]`` label so the tutor knows
+    whether it is reading a transcript or something typed.
+    """
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    for turn in turns[-MAX_HISTORY_TURNS:]:
+        text = str(turn.get("text", "")).strip()
+        if not text:
+            continue
+        if turn.get("role") == "tutor":
+            messages.append({"role": "assistant", "content": text})
+        else:
+            kind = "voice" if turn.get("kind") == "voice" else "text"
+            messages.append({"role": "user", "content": f"[{kind}] {text}"})
+    return messages
+
+
+def respond(
     source_sentence: str,
-    transcription: str,
+    turns: list[dict[str, str]],
     language: str,
     native_language: str,
     client: OpenAI | None = None,
-) -> dict:
-    """Evaluate the learner's spoken translation."""
+) -> dict[str, str]:
+    """Answer the learner's latest turn inside the running practice session.
+
+    ``turns`` is the whole conversation of this exercise, oldest first, each
+    item ``{"role": "learner"|"tutor", "kind": "voice"|"text", "text": ...}``.
+    Returns ``{"verdict": ..., "reply": ...}`` where the verdict is ``"none"``
+    unless the latest turn was an attempt at the exercise.
+    """
     client = _client(client)
-    system = _EVAL_TEMPLATE.format(
+    system = _CHAT_TEMPLATE.format(
         native_name=_native_name(native_language),
         target_name=_target_name(language),
         source_sentence=source_sentence,
-        transcription=transcription,
     )
     resp = client.chat.completions.create(
         model=settings.openai_exercise_model,
-        messages=[{"role": "system", "content": system}],
+        messages=_chat_messages(system, turns),
         response_format={"type": "json_object"},
-        temperature=0.3,
+        temperature=0.5,
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
-    status = str(payload.get("status", "Incorrect")).strip()
-    feedback = str(payload.get("feedback", "")).strip()
+    verdict = str(payload.get("verdict", "none")).strip().lower()
+    if verdict not in VERDICTS:
+        verdict = "none"
+    return {"verdict": verdict, "reply": str(payload.get("reply", "")).strip()}
 
-    # Keep the first line short and clean.
-    words = status.split()
-    if len(words) > 2:
-        lowered = status.lower()
-        if "almost" in lowered and "correct" in lowered:
-            status = "Almost correct"
-        elif "correct" in lowered:
-            status = "Correct"
-        else:
-            status = "Incorrect"
-    else:
-        # Capitalise single-word statuses.
-        status = " ".join(w.capitalize() for w in words)
 
-    return {"status": status, "feedback": feedback}
+def build_reply_html(
+    result: dict[str, str],
+    native_language: str,
+    transcription: str | None = None,
+) -> str:
+    """Render the tutor's answer, echoing the transcript of a voice turn."""
+    labels = _labels(native_language)
+    blocks: list[str] = []
+    verdict = result.get("verdict", "none")
+    if verdict in ("correct", "almost", "incorrect"):
+        blocks.append(f"<b>{escape(labels[verdict])}</b>")
+    if transcription:
+        blocks.append(f"{escape(labels['heard'])}\n<i>{escape(transcription)}</i>")
+    reply = result.get("reply", "")
+    if reply:
+        blocks.append(escape(reply))
+    return "\n\n".join(blocks)

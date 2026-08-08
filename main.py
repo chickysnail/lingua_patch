@@ -55,10 +55,6 @@ router = Router()
 # Set once in main(); used by /time handlers to (un)schedule per-user jobs.
 _scheduler: AsyncIOScheduler | None = None
 
-# Small cache for the current speaking exercise; the DB is authoritative so a
-# restart does not lose an exercise.
-_active_exercises: dict[int, dict[str, Any]] = {}
-
 # Users whose exercise is being generated right now — guards against repeated taps.
 _generating_exercises: set[int] = set()
 
@@ -189,6 +185,8 @@ async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
         log.exception("Failed to deliver to %s", user_id)
         return False
 
+    # A delivered patch ends the practice session that was running, if any.
+    db.clear_active_exercise(user_id)
     db.record_sent(user_id, content["id"])
     _maybe_expand(bot, user_id, language, native, difficulty)
     return True
@@ -625,7 +623,6 @@ async def _start_practice(
             "native_language": native,
         }
         db.set_active_exercise(user_id, **exercise_state)
-        _active_exercises[user_id] = exercise_state
 
         status = await bot.send_message(user_id, speaking.hints_pending_text(native))
         try:
@@ -716,18 +713,69 @@ async def _replace(status: Message | None, message: Message, text: str) -> None:
     await message.answer(text)
 
 
+async def _reply_in_session(
+    message: Message,
+    status: Message | None,
+    exercise: dict[str, Any],
+    text: str,
+    kind: str,
+) -> None:
+    """Answer one learner turn as part of the running practice conversation.
+
+    The turn and the answer join the session history, so the next turn is read
+    in context: a second attempt, a follow-up question, or anything else about
+    the exercise. The session lives until the next practice or the next patch.
+    """
+    user_id = message.from_user.id
+    native = exercise["native_language"]
+    turns = [*exercise.get("turns", []), {"role": "learner", "kind": kind, "text": text}]
+    try:
+        result = await asyncio.to_thread(
+            speaking.respond,
+            exercise["source_sentence"],
+            turns,
+            exercise["language"],
+            native,
+        )
+    except Exception:
+        log.exception("Practice reply failed for user %s", user_id)
+        await _replace(status, message, "Не удалось ответить. Попробуй ещё раз.")
+        return
+
+    if not result["reply"]:
+        await _replace(status, message, "Не удалось ответить. Попробуй ещё раз.")
+        return
+
+    db.append_exercise_turns(
+        user_id,
+        [
+            {"role": "learner", "kind": kind, "text": text},
+            {"role": "tutor", "kind": "text", "text": result["reply"]},
+        ],
+    )
+    await _replace(
+        status,
+        message,
+        speaking.build_reply_html(
+            result, native, transcription=text if kind == "voice" else None
+        ),
+    )
+
+
 @router.message(F.voice)
 async def on_voice(message: Message, bot: Bot) -> None:
-    """Accept a voice answer to the current speaking exercise."""
+    """Accept a voice turn in the current speaking exercise."""
     user_id = message.from_user.id
     if message.voice.duration > MAX_VOICE_DURATION_SECONDS:
         await message.answer(
             "Голосовое слишком длинное. Запиши ответ до 1 минуты и попробуй ещё раз."
         )
         return
-    exercise = db.get_active_exercise(user_id) or _active_exercises.get(user_id)
+    exercise = db.get_active_exercise(user_id)
     if not exercise:
-        await message.answer("Сначала нажми «🎙 Практика», чтобы начать упражнение.")
+        await message.answer(
+            f"Сначала нажми «{PRACTICE_TEXT}», чтобы начать упражнение."
+        )
         return
 
     try:
@@ -746,9 +794,9 @@ async def on_voice(message: Message, bot: Bot) -> None:
             return
 
         try:
-            text = await asyncio.to_thread(
-                speaking.transcribe_voice, audio_path, exercise["language"]
-            )
+            # No language hint: the learner may be attempting the sentence in
+            # the target language or asking about it in their own.
+            text = await asyncio.to_thread(speaking.transcribe_voice, audio_path)
         except speaking.STTConfigurationError as exc:
             log.exception("STT configuration failed for user %s", user_id)
             await _replace(
@@ -775,27 +823,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
         await _replace(status, message, "Я ничего не услышал. Попробуй ещё раз.")
         return
 
-    try:
-        result = await asyncio.to_thread(
-            speaking.evaluate_translation,
-            exercise["source_sentence"],
-            text,
-            exercise["language"],
-            exercise["native_language"],
-        )
-    except Exception:
-        log.exception("Evaluation failed for user %s", user_id)
-        await _replace(status, message, "Не удалось оценить ответ. Попробуй ещё раз.")
-        return
-
-    response = (
-        f"<b>{html.escape(result['status'])}</b>\n\n"
-        f"Вот что я услышал:\n<i>{html.escape(text)}</i>\n\n"
-        f"{html.escape(result['feedback'])}"
-    )
-    await _replace(status, message, response)
-    db.clear_active_exercise(user_id)
-    _active_exercises.pop(user_id, None)
+    await _reply_in_session(message, status, exercise, text, "voice")
 
 
 # --------------------------------------------------------------------------- #
@@ -954,10 +982,18 @@ def _parse_time(text: str) -> str | None:
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, bot: Bot) -> None:
-    """Free text: parse a custom delivery time if we're awaiting one."""
+    """Free text: a custom delivery time, or a turn in the practice session.
+
+    Voice is the way to practise, so typing is never advertised — but a typed
+    message during an exercise is still part of that conversation (usually a
+    question about it).
+    """
     db.upsert_user(message.from_user.id)
     user = db.get_user(message.from_user.id)
     if not user.get("awaiting_time"):
+        exercise = db.get_active_exercise(message.from_user.id)
+        if exercise:
+            await _reply_in_session(message, None, exercise, message.text, "text")
         return
     parsed = _parse_time(message.text)
     if parsed is None:
