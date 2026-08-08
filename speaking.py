@@ -1,15 +1,18 @@
 """Speaking exercise: generate a practice sentence plus theory, transcribe the
 learner's voice, and talk them through the exercise.
 
-Once the task is sent, every learner turn — spoken (the normal way) or typed —
-is answered in the context of the whole session by a bilingual speaker who
-never leaves the topic of language learning.
+Everything is one conversation with a bilingual speaker who never leaves the
+topic of language learning. The notes they write before the attempt are a turn
+of that conversation like any other, so the same person later grades the attempt
+against what they themselves taught, and may write further notes whenever the
+learner asks about something.
 
 The sentence is generated on its own so the learner gets the task immediately;
-the theory is generated afterwards and folded into the same rich message. The
-vocabulary table is visible right away and every other hint — each grammar
-table, the key phrases, the word-order notes — sits in its own collapsible
-block. It is a pure textbook chapter and never contains the answer.
+the notes are generated afterwards and folded into the same rich message. Notes
+are a short ordered list of blocks the teacher chooses freely — a block is a
+title plus prose, a table and an example, in any combination — and all but one
+are collapsed, so several topics cost little space. They never contain the
+answer.
 """
 from __future__ import annotations
 
@@ -29,11 +32,11 @@ from languages import ENGLISH_NAMES, ISO_639_1, LANGUAGES, NATIVE_NAMES
 log = logging.getLogger(__name__)
 
 MAX_VOCABULARY_ITEMS = 8
-MAX_GRAMMAR_TABLES = 4
+MAX_BLOCKS = 6
+MAX_EXPLANATION_BLOCKS = 3
 MAX_ROWS_PER_TABLE = 12
-MAX_KEY_PHRASES = 5
-MAX_NOTES = 4
 MAX_CELL_CHARS = 200
+MAX_TEXT_CHARS = 600
 # Telegram caps a rich message at 32768 characters; stay well below it.
 MAX_RICH_CHARS = 30_000
 
@@ -54,53 +57,66 @@ _SENTENCE_SYSTEM = (
     'Respond ONLY with JSON: {"source_sentence": "..."}'
 )
 
+# Shared by the notes written before the attempt and by any notes the teacher
+# decides to write later in the conversation.
+_BLOCKS_RULES = (
+    "Notes are an ordered list of blocks. A block has a short warm title and, in any "
+    'combination, a paragraph of prose ("text"), a small table and one example. Use a table '
+    "only where a table genuinely earns its space — a conjugation or declension paradigm, a "
+    "word list with meanings, two options side by side; otherwise write prose.\n"
+    "- Prose, titles and table headers are in the learner's NATIVE language; words, forms and "
+    "examples are in the target language. Warm, conversational tone, no academic jargon.\n"
+    "- In a word list, the target-language dictionary form comes first and its native meaning "
+    "second — never the other way round.\n"
+    "- A conjugation table has exactly TWO columns and is never transposed: every row is "
+    "[target pronoun + native gloss, target-language form], labelled like 'eu (я)', "
+    "'tu (ты)', 'ele/ela (он/она)', 'nós (мы)', 'vocês (вы)', 'eles/elas (они)'. Never use "
+    "the words 'единственное', 'множественное' or 'лицо' as labels. Give the tense the "
+    "sentence actually needs, not the present by default. Every form must be the real form "
+    "for that exact pronoun — re-check the paradigm before answering, and never repeat a form "
+    "across pronouns unless the language truly shares it. Rows have as many cells as "
+    "headers.\n"
+    'Set "open": true on at most ONE block — it is shown expanded, so pick the one they will '
+    "need first (usually the words). Every other block stays collapsed until tapped, which is "
+    "why several small focused blocks are better than one long one."
+)
+
+_BLOCKS_SCHEMA = (
+    '"blocks": [{"title": "...", "text": "...", "open": false, '
+    '"table": {"headers": ["...", "..."], "rows": [["...", "..."]]}, '
+    '"example": {"target": "...", "native": "..."}}]'
+)
+
+# The chat system prompt goes through str.format, which chokes on JSON braces.
+_BLOCKS_SCHEMA_ESCAPED = _BLOCKS_SCHEMA.replace("{", "{{").replace("}", "}}")
+
 _THEORY_SYSTEM = (
-    "You are a bilingual language teacher who speaks both the learner's native language "
-    "and the target language. Given a source sentence in the learner's native language, you "
-    "produce the theory the learner needs to say it in the target language themselves.\n"
-    "Rules:\n"
-    "- All explanations, notes and table headers are written in the NATIVE language; example "
-    "forms are in the target language. Use a warm, conversational Duolingo Guidebook tone, "
-    "with playful short tip titles.\n"
-    "- Every table header, including the subject and verb headers, must be written in the "
-    "learner's NATIVE language, never English placeholders.\n"
-    "- NEVER write the target-language translation of the source sentence, and never give a "
-    "ready-made phrase that only has to be read out. Teach the pieces, not the answer.\n"
-    "- 'grammar' must contain REAL tables: full conjugation of every verb the sentence needs, "
-    "all persons of the tense the sentence actually requires (past sentence -> past tense table, "
-    "not present), plus declensions, articles, pronoun or plural tables "
-    "when the sentence needs them. Each table gets a title, a short explanation of when the "
-    "form is used, header cells and rows. For a conjugation table, use exactly TWO columns: "
-    "the native-language equivalent of 'subject' and 'verb/form'; every row is exactly "
-    "[target pronoun + native gloss, target-language form]. Never transpose the table. "
-    "Rows must have exactly as many cells as headers. "
-    "Table row labels MUST be target-language pronoun plus native gloss exactly like "
-    "'eu (я)', 'tu (ты)', 'ele/ela (он/она)', 'nós (мы)', 'vocês (вы)', "
-    "'eles/elas (они)' where applicable. Never use the academic words "
-    "'единственное', 'множественное', or 'лицо' in table labels.\n"
-    "- Every conjugated or declined form must be the real, correct form for that exact "
-    "pronoun and tense. Do not repeat a form across different pronouns unless the language "
-    "genuinely shares that form. Re-check every table row against the actual paradigm before "
-    "returning the JSON.\n"
-    "- Each grammar item also has a short native-language 'notice' nudge (or empty string) "
-    "and one concrete 'example' object with target and native strings.\n"
-    "- Include 3-5 useful 'key_phrases' in the target language with native translations. "
-    "They must be different phrases, not the source sentence or its translation.\n"
-    "- In 'vocabulary', 'word' is the TARGET-language dictionary form and 'translation' is its "
-    "native-language meaning — never the other way round.\n"
-    "- 'notes' explains word order and how the pieces combine (2-4 short items).\n"
-    "- Keep the theory concise: no more than 8 vocabulary items, 4 grammar tables, "
-    "12 rows per table, 5 key phrases, and 4 notes; keep each cell near 200 characters.\n"
-    "Respond ONLY with JSON:\n"
-    '{"vocabulary": [{"word": "<target-language dictionary form>", '
-    '"translation": "<native-language meaning>", '
-    '"note": "grammatical info, e.g. verb, 2nd conjugation / noun, feminine"}], '
-    '"grammar": [{"title": "...", "explanation": "...", '
-    '"headers": ["...", "..."], '
-    '"rows": [["<target pronoun> (<native gloss>)", "<target form>"]], "notice": "...", '
-    '"example": {"target": "...", "native": "..."}}], '
-    '"key_phrases": [{"target": "...", "native": "..."}], '
-    '"notes": ["..."]}'
+    "You are a person who grew up speaking both the learner's native language and the target "
+    "language. You have just asked the learner to say one native-language sentence out loud in "
+    "the target language, and now you jot down the notes you think they need.\n"
+    "You decide what is worth explaining. Read the sentence, picture what actually trips up a "
+    "speaker of that native language when saying this in the target language, and cover only "
+    "that — a form they cannot guess, a preposition that comes with a verb, an agreement, a "
+    "word order that differs. Skip whatever they can work out themselves.\n"
+    "Your notes are not a specification the answer will be checked against: wherever the "
+    "sentence can be said in more than one natural way, give the options together and add one "
+    "line on how they differ in feel or register, so the learner is free to choose. Where you "
+    "are unsure a word is the idiomatic one, say so rather than presenting it as the only "
+    "choice.\n"
+    "NEVER write the full target-language translation of the sentence, and never lay the notes "
+    "out as a phrase-by-phrase gloss of it (a block per chunk of the sentence, each one giving "
+    "that chunk translated, is the same as handing over the answer). Titles name what is being "
+    "taught — a word, a form, a rule — not a fragment of the sentence, and examples illustrate "
+    "it on something OTHER than the sentence itself. The learner must still assemble it.\n"
+    "So for a sentence about smelling fresh bread and giving in to a night snack, blocks whose "
+    "titles are 'smelled the smell', 'fresh bread', 'night snack' are exactly wrong — that is "
+    "the sentence handed back in pieces. Blocks along the lines of 'what follows sentir', "
+    "'the adjective comes after the noun' and 'two ways to say \"could not\": pude and "
+    "consegui' teach the same material and leave the sentence to the learner (write such titles "
+    "in the learner's native language, of course).\n"
+    + _BLOCKS_RULES
+    + "\nBe brief: at most 6 blocks, 12 rows per table, ~200 characters per cell.\n"
+    "Respond ONLY with JSON: {" + _BLOCKS_SCHEMA + "}"
 )
 
 MAX_HISTORY_TURNS = 20
@@ -111,11 +127,19 @@ _CHAT_TEMPLATE = (
     "sitting next to a learner during ONE speaking exercise. You were the one who set the "
     "task: say this {native_name} sentence out loud in {target_name}:\n"
     '"{source_sentence}"\n\n'
-    "You see the whole conversation of this exercise. Every learner turn is labelled: "
-    "[voice] is a speech-to-text transcript of what they said out loud — expect small "
+    "You see the whole conversation of this exercise. Every turn is labelled: "
+    "[voice] is a speech-to-text transcript of what the learner said out loud — expect small "
     "recognition artefacts (missing punctuation, a homophone, a swallowed ending) and never "
     "build a correction on something that is obviously just misheard; [text] is typed, may be "
-    "in any language and is often a question rather than an attempt.\n"
+    "in any language and is often a question rather than an attempt; [notes] is a set of "
+    "written notes YOU sent them earlier.\n"
+    "Those notes are what the learner is working from, so honour them: anything they built out "
+    "of the words and forms you taught is a legitimate answer. Judge whether the sentence "
+    "works in {target_name} and carries the meaning, never whether it matches the wording you "
+    "would have picked — if theirs is natural, it is correct even when you would say it "
+    "differently, and you may mention your version as an alternative rather than a fix. Only "
+    "call something wrong when it is actually wrong or would sound off to a native ear, and "
+    "if that mistake came from your own notes being unclear or misleading, say so plainly.\n"
     "Decide what the latest turn is and answer accordingly:\n"
     "- An attempt at the exercise: reply the way a bilingual friend actually would. If it was "
     "right, confirm it warmly and, if useful, add one natural-sounding alternative. If it was "
@@ -132,11 +156,22 @@ _CHAT_TEMPLATE = (
     "requests to be a general assistant): decline in one friendly sentence and bring them "
     "back to the exercise. You only ever talk about learning {target_name}.\n"
     "Style: write in {native_name}; only examples and corrected sentences are in "
-    "{target_name}. Address the learner informally. Keep it under 60 words, plain sentences, "
-    "no bullet lists, no headings, no emoji spam. When you invite another attempt, invite "
-    "them to SAY it out loud — never suggest writing or typing it.\n"
+    "{target_name}. Address the learner informally. Keep the spoken reply under 60 words, "
+    "plain sentences, no bullet lists, no headings, no emoji spam. When you invite another "
+    "attempt, invite them to SAY it out loud — never suggest writing or typing it.\n"
+    "You may attach fresh written notes to your reply whenever laying something out properly "
+    "would help more than talking: a paradigm they keep missing, two words compared side by "
+    "side, the rule behind a question they just asked. The notes arrive as a separate message "
+    "under your reply, so keep the reply itself short and conversational and let the notes "
+    "carry the detail instead of repeating it. Attach nothing (\"notes\": null) when a couple "
+    "of spoken sentences really are enough, and never re-send notes you already sent. At most "
+    "3 blocks.\n"
+    + _BLOCKS_RULES
+    + "\n"
     'Respond ONLY with JSON: {{"verdict": "correct" | "almost" | "incorrect" | "none", '
-    '"reply": "your answer in {native_name}"}} '
+    '"reply": "your answer in {native_name}", "notes": null | {{'
+    + _BLOCKS_SCHEMA_ESCAPED
+    + "}}}} "
     'where "verdict" describes the latest attempt and is "none" when the latest turn is not '
     "an attempt."
 )
@@ -151,11 +186,7 @@ _LABELS: dict[str, dict[str, str]] = {
             "голосовым сообщением:"
         ),
         "hints_pending": "Готовлю подсказки...",
-        "vocabulary": "Слова",
-        "grammar": "Грамматика",
-        "key_phrases": "Полезные фразы",
-        "notice": "Обрати внимание",
-        "notes": "Как собрать фразу",
+        "note": "Заметка",
         "heard": "Вот что я услышал:",
         "correct": "✅ Верно",
         "almost": "🟡 Почти",
@@ -169,11 +200,7 @@ _LABELS: dict[str, dict[str, str]] = {
             "voice message:"
         ),
         "hints_pending": "Preparing hints...",
-        "vocabulary": "Vocabulary",
-        "grammar": "Grammar",
-        "key_phrases": "Key phrases",
-        "notice": "Notice",
-        "notes": "Putting it together",
+        "note": "Note",
         "heard": "Here's what I heard:",
         "correct": "✅ Correct",
         "almost": "🟡 Almost",
@@ -187,11 +214,7 @@ _LABELS: dict[str, dict[str, str]] = {
             "голосовим повідомленням:"
         ),
         "hints_pending": "Готую підказки...",
-        "vocabulary": "Слова",
-        "grammar": "Граматика",
-        "key_phrases": "Корисні фрази",
-        "notice": "Зверни увагу",
-        "notes": "Як скласти фразу",
+        "note": "Замітка",
         "heard": "Ось що я почув:",
         "correct": "✅ Правильно",
         "almost": "🟡 Майже",
@@ -231,17 +254,9 @@ def _bounded_list(value: object, limit: int) -> list:
 
 
 def _table(item: object) -> dict:
-    """Normalise one grammar table, dropping rows that do not fit the headers."""
+    """Normalise one table, dropping rows that do not fit the headers."""
     if not isinstance(item, dict):
-        return {
-            "title": "",
-            "explanation": "",
-            "headers": [],
-            "rows": [],
-            "notice": "",
-            "example": {"target": "", "native": ""},
-        }
-    title = _clip(item.get("title", ""))
+        return {"headers": [], "rows": []}
     raw_headers = item.get("headers", [])
     headers = (
         [_clip(cell) for cell in raw_headers if str(cell).strip()]
@@ -261,14 +276,7 @@ def _table(item: object) -> dict:
         if headers:
             cells = (cells + [""] * len(headers))[: len(headers)]
         rows.append(cells)
-    return {
-        "title": title,
-        "explanation": _clip(item.get("explanation", "")),
-        "headers": headers,
-        "rows": rows,
-        "notice": _clip(item.get("notice", "")),
-        "example": _example(item.get("example")),
-    }
+    return {"headers": headers, "rows": rows}
 
 
 def _example(item: object) -> dict[str, str]:
@@ -280,14 +288,36 @@ def _example(item: object) -> dict[str, str]:
     }
 
 
-def _key_phrase(item: object) -> dict[str, str] | None:
+def _block(item: object) -> dict | None:
+    """Normalise one note block; None when nothing usable is left."""
     if not isinstance(item, dict):
         return None
-    target = _clip(item.get("target", ""))
-    native = _clip(item.get("native", ""))
-    if not target or not native:
+    text = str(item.get("text") or "").strip()
+    if len(text) > MAX_TEXT_CHARS:
+        text = text[: MAX_TEXT_CHARS - 1].rstrip() + "…"
+    block = {
+        "title": _clip(item.get("title", "")),
+        "text": text,
+        "open": bool(item.get("open")),
+        "table": _table(item.get("table")),
+        "example": _example(item.get("example")),
+    }
+    if not block["text"] and not block["table"]["rows"] and not block["example"]["target"]:
         return None
-    return {"target": target, "native": native}
+    return block
+
+
+def _blocks(payload: object, limit: int = MAX_BLOCKS) -> list[dict]:
+    """Normalise the block list of a notes payload, keeping one block open."""
+    items = payload.get("blocks") if isinstance(payload, dict) else None
+    blocks = [
+        block
+        for item in _bounded_list(items, limit)
+        if (block := _block(item)) is not None
+    ]
+    for block in blocks[1:]:
+        block["open"] = False
+    return blocks
 
 
 def generate_sentence(
@@ -348,7 +378,10 @@ def generate_theory(
     difficulty: str | None = None,
     client: OpenAI | None = None,
 ) -> dict:
-    """Generate the theory needed to translate ``source_sentence``."""
+    """Write the notes the learner needs to say ``source_sentence`` themselves.
+
+    The teacher chooses the blocks; nothing here dictates which topics appear.
+    """
     client = _client(client)
     target_name = _target_name(language)
     native_name = _native_name(native_language)
@@ -359,10 +392,9 @@ def generate_theory(
         f"Level: {difficulty or 'mixed'}",
         f"Source sentence ({native_name}): {source_sentence}",
         (
-            f"Give the theory needed to translate it into {target_name}: {target_name} "
-            f"vocabulary in dictionary form with its {native_name} meaning, full "
-            "conjugation/declension tables for the forms involved, and short notes on word "
-            "order. Do not reveal the translated sentence."
+            f"Write your notes for saying it in {target_name}. Cover only what this learner "
+            "actually needs; show the choices where more than one wording is natural. Do not "
+            "reveal the translated sentence."
         ),
     ]
 
@@ -376,34 +408,9 @@ def generate_theory(
         temperature=0.8,
     )
     payload = json.loads(resp.choices[0].message.content or "{}")
-    vocabulary_items = _bounded_list(payload.get("vocabulary"), MAX_VOCABULARY_ITEMS)
-    grammar_items = _bounded_list(payload.get("grammar"), MAX_GRAMMAR_TABLES)
-    phrase_items = _bounded_list(payload.get("key_phrases"), MAX_KEY_PHRASES)
-    note_items = _bounded_list(payload.get("notes"), MAX_NOTES)
-    grammar = [
-        _table(item)
-        for item in grammar_items
-        if isinstance(item, dict)
-    ]
-    key_phrases = [
-        phrase
-        for item in phrase_items
-        if (phrase := _key_phrase(item)) is not None
-    ]
     return {
         "source_sentence": _clip(source_sentence),
-        "vocabulary": [
-            {
-                "word": _clip(item.get("word", "")),
-                "translation": _clip(item.get("translation", "")),
-                "note": _clip(item.get("note", "")),
-            }
-            for item in vocabulary_items
-            if isinstance(item, dict) and str(item.get("word", "")).strip()
-        ],
-        "grammar": [table for table in grammar if table["rows"]],
-        "key_phrases": key_phrases,
-        "notes": [_clip(note) for note in note_items if str(note).strip()],
+        "blocks": _blocks(payload),
         "language": language,
         "native_language": native_language,
     }
@@ -427,60 +434,41 @@ def _rich_table(headers: list[str], rows: list[list[str]]) -> str:
     return f"<table bordered striped>{head}{body}</table>"
 
 
-def _vocabulary_section(exercise: dict, labels: dict[str, str]) -> str:
-    """Visible-by-default vocabulary table — the first thing the learner sees."""
-    rows = [
-        [item["word"], item.get("translation", ""), item.get("note", "")]
-        for item in exercise.get("vocabulary", [])
-    ]
-    if not rows:
-        return ""
-    return f"<h3>{escape(labels['vocabulary'])}</h3>" + _rich_table([], rows)
+def _block_body(block: dict) -> str:
+    """The prose, table and example of one block as rich-message HTML."""
+    body = f"<p>{escape(block['text'])}</p>" if block["text"] else ""
+    table = block["table"]
+    if table["rows"]:
+        body += _rich_table(table["headers"], table["rows"])
+    example = block["example"]
+    if example["target"]:
+        native = f" — {escape(example['native'])}" if example["native"] else ""
+        body += f"<blockquote><b>{escape(example['target'])}</b>{native}</blockquote>"
+    return body
 
 
-def _grammar_sections(exercise: dict, labels: dict[str, str]) -> list[str]:
-    """One collapsible block per grammar table, so hints open one at a time."""
+def _block_sections(blocks: list[dict], labels: dict[str, str]) -> list[str]:
+    """Render blocks, collapsing every one the teacher did not mark as open."""
     sections: list[str] = []
-    for raw_table in exercise.get("grammar", []):
-        table = _table(raw_table)
-        if not table["rows"]:
+    for block in blocks:
+        title = escape(block["title"] or labels["note"])
+        body = _block_body(block)
+        if not body:
             continue
-        summary = escape(table["title"] or labels["grammar"])
-        body = (
-            f"<p>{escape(table['explanation'])}</p>" if table["explanation"] else ""
-        ) + _rich_table(table["headers"], table["rows"])
-        if table["notice"]:
-            body += (
-                f"<p>⚠️ <b>{escape(labels['notice'])}:</b> {escape(table['notice'])}</p>"
-            )
-        example = table["example"]
-        if example["target"] and example["native"]:
-            body += (
-                f"<blockquote><b>{escape(example['target'])}</b> — "
-                f"{escape(example['native'])}</blockquote>"
-            )
-        sections.append(_details(summary, body))
+        sections.append(
+            f"<h3>{title}</h3>{body}" if block["open"] else _details(title, body)
+        )
     return sections
 
 
-def _phrases_section(exercise: dict, labels: dict[str, str], target_name: str, native_name: str) -> str:
-    rows = [
-        [phrase["target"], phrase["native"]]
-        for item in exercise.get("key_phrases", [])
-        if (phrase := _key_phrase(item)) is not None
-    ]
-    if not rows:
-        return ""
-    table = _rich_table([target_name, native_name], rows)
-    return _details(escape(labels["key_phrases"]), table)
-
-
-def _notes_section(exercise: dict, labels: dict[str, str]) -> str:
-    notes = exercise.get("notes", [])
-    if not notes:
-        return ""
-    items = "".join(f"<li>{escape(note)}</li>" for note in notes)
-    return _details(escape(labels["notes"]), f"<ul>{items}</ul>")
+def _fit(header: str, sections: list[str]) -> str:
+    """Join sections under ``header``, dropping trailing ones that do not fit."""
+    html = header + "".join(sections)
+    while len(html) > MAX_RICH_CHARS and sections:
+        log.warning("Practice notes exceeded %d chars; dropping a block.", MAX_RICH_CHARS)
+        sections.pop()
+        html = header + "".join(sections)
+    return html
 
 
 def hints_pending_text(native_language: str) -> str:
@@ -511,90 +499,91 @@ def build_task_fallback_html(source_sentence: str, native_language: str) -> str:
 
 
 def build_exercise_rich_html(exercise: dict) -> str:
-    """Render the task plus theory as rich-message HTML for ``sendRichMessage``.
+    """Render the task plus the notes as rich-message HTML for ``sendRichMessage``.
 
-    The vocabulary table is expanded; every other hint is a separate
-    ``<details>`` block the learner can open on its own.
+    The one block the teacher marked as open is expanded; the rest are separate
+    ``<details>`` blocks the learner opens on their own.
     """
-    language = exercise["language"]
-    native_language = exercise["native_language"]
-    target_name = LANGUAGES[language].name if language in LANGUAGES else _target_name(language)
-    native_name = _native_name(native_language)
-    labels = _labels(native_language)
-
+    labels = _labels(exercise["native_language"])
     header = (
         _task_block(exercise.get("source_sentence", ""), labels)
         + f"<h2>📘 {escape(labels['title'])}</h2>"
     )
-    sections = [
-        _vocabulary_section(exercise, labels),
-        *_grammar_sections(exercise, labels),
-        _phrases_section(exercise, labels, target_name, native_name),
-        _notes_section(exercise, labels),
-    ]
-    sections = [section for section in sections if section]
+    return _fit(header, _block_sections(exercise.get("blocks", []), labels))
 
-    html = header + "".join(sections)
-    while len(html) > MAX_RICH_CHARS and sections:
-        log.warning("Practice theory exceeded %d chars; dropping a section.", MAX_RICH_CHARS)
-        sections.pop()
-        html = header + "".join(sections)
-    return html
+
+def build_notes_rich_html(notes: dict, native_language: str) -> str:
+    """Render standalone notes the teacher wrote during the conversation."""
+    labels = _labels(native_language)
+    return _fit("", _block_sections(notes.get("blocks", []), labels))
+
+
+def _fallback_blocks(blocks: list[dict], labels: dict[str, str]) -> list[str]:
+    """Blocks with classic formatting: an expandable blockquote each."""
+    lines: list[str] = []
+    for block in blocks:
+        body = [escape(block["text"])] if block["text"] else []
+        body += [
+            " — ".join(escape(cell) for cell in row if cell)
+            for row in block["table"]["rows"]
+        ]
+        example = block["example"]
+        if example["target"]:
+            native = f" — {escape(example['native'])}" if example["native"] else ""
+            body.append(f"<b>{escape(example['target'])}</b>{native}")
+        if not body:
+            continue
+        title = escape(block["title"] or labels["note"])
+        lines.append(
+            f"\n<blockquote expandable><b>{title}</b>\n" + "\n".join(body) + "</blockquote>"
+        )
+    return lines
 
 
 def build_exercise_fallback_html(exercise: dict) -> str:
-    """Render the task plus theory with classic message formatting.
+    """Render the task plus the notes with classic message formatting.
 
-    Used when the rich message is rejected: no tables or per-section
-    collapsing, but every block after the vocabulary is an expandable
-    blockquote, so the message still stays short.
+    Used when the rich message is rejected: no tables, but every block is an
+    expandable blockquote, so the message still stays short.
     """
     labels = _labels(exercise["native_language"])
-
     lines = [
         build_task_fallback_html(
             exercise.get("source_sentence", ""), exercise["native_language"]
         ),
         f"\n📘 <b>{escape(labels['title'])}</b>",
+        *_fallback_blocks(exercise.get("blocks", []), labels),
     ]
-    vocabulary = exercise.get("vocabulary", [])
-    if vocabulary:
-        lines.append(f"\n<b>{escape(labels['vocabulary'])}</b>")
-        lines += [
-            f"• <b>{escape(item['word'])}</b> — {escape(item.get('translation', ''))}"
-            for item in vocabulary
-        ]
-
-    def _quote(title: str, body: list[str]) -> str:
-        return (
-            f"\n<blockquote expandable><b>{escape(title)}</b>\n"
-            + "\n".join(body)
-            + "</blockquote>"
-        )
-
-    for raw_table in exercise.get("grammar", []):
-        table = _table(raw_table)
-        if not table["rows"]:
-            continue
-        body = [escape(table["explanation"])] if table["explanation"] else []
-        body += [" — ".join(escape(cell) for cell in row if cell) for row in table["rows"]]
-        if table["notice"]:
-            body.append(f"⚠️ {escape(table['notice'])}")
-        lines.append(_quote(table["title"] or labels["grammar"], body))
-
-    phrases = [
-        f"<b>{escape(phrase['target'])}</b> — {escape(phrase['native'])}"
-        for item in exercise.get("key_phrases", [])
-        if (phrase := _key_phrase(item)) is not None
-    ]
-    if phrases:
-        lines.append(_quote(labels["key_phrases"], phrases))
-
-    notes = [escape(note) for note in exercise.get("notes", [])]
-    if notes:
-        lines.append(_quote(labels["notes"], notes))
-
     return "\n".join(lines)
+
+
+def build_notes_fallback_html(notes: dict, native_language: str) -> str:
+    """Standalone conversation notes with classic message formatting."""
+    labels = _labels(native_language)
+    lines = _fallback_blocks(notes.get("blocks", []), labels)
+    return "\n".join(lines).lstrip("\n")
+
+
+def notes_to_text(notes: dict, native_language: str | None = None) -> str:
+    """Flatten notes into plain text so they can live in the conversation.
+
+    This is what the teacher sees on the next turn, so it must contain
+    everything they taught — titles, prose, every table row and the examples.
+    """
+    labels = _labels(native_language or notes.get("native_language", "eng"))
+    parts: list[str] = []
+    for block in notes.get("blocks", []):
+        lines = [block["title"] or labels["note"]]
+        if block["text"]:
+            lines.append(block["text"])
+        lines += [
+            " — ".join(cell for cell in row if cell) for row in block["table"]["rows"]
+        ]
+        example = block["example"]
+        if example["target"]:
+            lines.append(f"{example['target']} — {example['native']}".rstrip(" —"))
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
 
 def transcribe_voice(audio_path: Path, language: str | None = None) -> str | None:
@@ -651,7 +640,8 @@ def _chat_messages(system: str, turns: list[dict[str, str]]) -> list[dict[str, s
     """Turn the stored conversation into OpenAI chat messages.
 
     Learner turns keep their ``[voice]``/``[text]`` label so the tutor knows
-    whether it is reading a transcript or something typed.
+    whether it is reading a transcript or something typed, and the notes the
+    tutor sent are labelled ``[notes]`` so it grades against what it taught.
     """
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     for turn in turns[-MAX_HISTORY_TURNS:]:
@@ -659,7 +649,8 @@ def _chat_messages(system: str, turns: list[dict[str, str]]) -> list[dict[str, s
         if not text:
             continue
         if turn.get("role") == "tutor":
-            messages.append({"role": "assistant", "content": text})
+            prefix = "[notes]\n" if turn.get("kind") == "notes" else ""
+            messages.append({"role": "assistant", "content": prefix + text})
         else:
             kind = "voice" if turn.get("kind") == "voice" else "text"
             messages.append({"role": "user", "content": f"[{kind}] {text}"})
@@ -672,13 +663,17 @@ def respond(
     language: str,
     native_language: str,
     client: OpenAI | None = None,
-) -> dict[str, str]:
+) -> dict:
     """Answer the learner's latest turn inside the running practice session.
 
     ``turns`` is the whole conversation of this exercise, oldest first, each
-    item ``{"role": "learner"|"tutor", "kind": "voice"|"text", "text": ...}``.
-    Returns ``{"verdict": ..., "reply": ...}`` where the verdict is ``"none"``
-    unless the latest turn was an attempt at the exercise.
+    item ``{"role": "learner"|"tutor", "kind": "voice"|"text"|"notes",
+    "text": ...}`` — including the notes sent with the task, so the answer is
+    judged against what this teacher actually taught.
+
+    Returns ``{"verdict": ..., "reply": ..., "notes": ...}``: the verdict is
+    ``"none"`` unless the latest turn was an attempt, and ``notes`` carries
+    extra written notes the teacher chose to attach (empty blocks otherwise).
     """
     client = _client(client)
     system = _CHAT_TEMPLATE.format(
@@ -696,11 +691,15 @@ def respond(
     verdict = str(payload.get("verdict", "none")).strip().lower()
     if verdict not in VERDICTS:
         verdict = "none"
-    return {"verdict": verdict, "reply": str(payload.get("reply", "")).strip()}
+    return {
+        "verdict": verdict,
+        "reply": str(payload.get("reply", "")).strip(),
+        "notes": {"blocks": _blocks(payload.get("notes"), MAX_EXPLANATION_BLOCKS)},
+    }
 
 
 def build_reply_html(
-    result: dict[str, str],
+    result: dict,
     native_language: str,
     transcription: str | None = None,
 ) -> str:
