@@ -705,6 +705,17 @@ async def _notify_admin_stt_failure(bot: Bot, user_id: int, kind: str, exc: Exce
         log.warning("Failed to notify admin about %s.", kind.lower())
 
 
+async def _replace(status: Message | None, message: Message, text: str) -> None:
+    """Update the placeholder in place, falling back to a fresh message."""
+    if status is not None:
+        try:
+            await status.edit_text(text)
+            return
+        except TelegramBadRequest:
+            pass
+    await message.answer(text)
+
+
 @router.message(F.voice)
 async def on_voice(message: Message, bot: Bot) -> None:
     """Accept a voice answer to the current speaking exercise."""
@@ -719,6 +730,11 @@ async def on_voice(message: Message, bot: Bot) -> None:
         await message.answer("Сначала нажми «🎙 Практика», чтобы начать упражнение.")
         return
 
+    try:
+        status: Message | None = await message.answer("🎧 Слушаю…")
+    except TelegramBadRequest:
+        status = None
+
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         audio_path = Path(tmp.name)
     try:
@@ -726,7 +742,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
             await bot.download(message.voice, destination=audio_path)
         except Exception:
             log.exception("Failed to download voice from user %s", user_id)
-            await message.answer("Не удалось скачать голосовое. Попробуй ещё раз.")
+            await _replace(status, message, "Не удалось скачать голосовое. Попробуй ещё раз.")
             return
 
         try:
@@ -735,27 +751,28 @@ async def on_voice(message: Message, bot: Bot) -> None:
             )
         except speaking.STTConfigurationError as exc:
             log.exception("STT configuration failed for user %s", user_id)
-            await message.answer(
-                "Проверка голосового ответа пока не настроена. "
-                "Попробуй позже."
+            await _replace(
+                status,
+                message,
+                "Проверка голосового ответа пока не настроена. Попробуй позже.",
             )
             await _notify_admin_stt_failure(bot, user_id, "STT configuration failed", exc)
             return
         except speaking.STTError as exc:
             log.exception("STT failed for user %s", user_id)
-            await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
+            await _replace(status, message, "Не удалось распознать речь. Попробуй ещё раз.")
             await _notify_admin_stt_failure(bot, user_id, "STT failed", exc)
             return
         except Exception as exc:
             log.exception("Unexpected STT failure for user %s", user_id)
-            await message.answer("Не удалось распознать речь. Попробуй ещё раз.")
+            await _replace(status, message, "Не удалось распознать речь. Попробуй ещё раз.")
             await _notify_admin_stt_failure(bot, user_id, "Unexpected STT failure", exc)
             return
     finally:
         audio_path.unlink(missing_ok=True)
 
     if not text:
-        await message.answer("Я ничего не услышал. Попробуй ещё раз.")
+        await _replace(status, message, "Я ничего не услышал. Попробуй ещё раз.")
         return
 
     try:
@@ -768,11 +785,15 @@ async def on_voice(message: Message, bot: Bot) -> None:
         )
     except Exception:
         log.exception("Evaluation failed for user %s", user_id)
-        await message.answer("Не удалось оценить ответ. Попробуй ещё раз.")
+        await _replace(status, message, "Не удалось оценить ответ. Попробуй ещё раз.")
         return
 
-    response = f"<b>{html.escape(result['status'])}</b>\n\n{html.escape(result['feedback'])}"
-    await message.answer(response)
+    response = (
+        f"<b>{html.escape(result['status'])}</b>\n\n"
+        f"Вот что я услышал:\n<i>{html.escape(text)}</i>\n\n"
+        f"{html.escape(result['feedback'])}"
+    )
+    await _replace(status, message, response)
     db.clear_active_exercise(user_id)
     _active_exercises.pop(user_id, None)
 
