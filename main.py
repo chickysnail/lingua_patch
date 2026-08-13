@@ -142,13 +142,17 @@ def _maybe_expand(
 # --------------------------------------------------------------------------- #
 # Core delivery
 # --------------------------------------------------------------------------- #
-async def deliver(bot: Bot, user: dict[str, Any]) -> bool:
+async def deliver(bot: Bot, user: dict[str, Any], scheduled: bool = False) -> bool:
     """Send one patch to a user. Returns True if delivered.
 
     Users never receive the same patch twice. If no unseen content is available,
     returns False (the caller should ensure pool expansion is triggered).
+    Scheduled sends are skipped for users who paused their patches.
     """
     user_id = user["user_id"]
+    if scheduled and user.get("is_paused"):
+        log.info("User %s is paused; skipping scheduled patch.", user_id)
+        return False
     language = user["language"]
     native = user.get("native_language", settings.native_language)
     difficulty = user.get("difficulty")
@@ -201,7 +205,7 @@ async def deliver_to_all(bot: Bot) -> int:
     log.info("Daily run: delivering to %d random-window user(s).", len(users))
     sent = 0
     for user in users:
-        if await deliver(bot, user):
+        if await deliver(bot, user, scheduled=True):
             sent += 1
     log.info("Daily run complete: %d delivered.", sent)
     return sent
@@ -212,7 +216,7 @@ async def deliver_to_user(bot: Bot, user_id: int) -> None:
     user = db.get_user(user_id)
     if not user or not user["is_active"]:
         return
-    await deliver(bot, user)
+    await deliver(bot, user, scheduled=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +320,8 @@ async def send_and_reschedule(scheduler: AsyncIOScheduler, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 PATCH_NOW_TEXT = "GET MORE"
 PRACTICE_TEXT = "Practice"
+PAUSE_TEXT = "pause the patches"
+RESUME_TEXT = "resume the patches"
 
 
 LET_S_PRACTICE = "Let's practice"
@@ -347,16 +353,17 @@ def _level_keyboard(current: str | None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _patch_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent reply keyboard with patch and practice buttons."""
+def _patch_keyboard(paused: bool = False) -> ReplyKeyboardMarkup:
+    """Persistent reply keyboard with patch, practice and pause/resume buttons."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=PATCH_NOW_TEXT)],
             [KeyboardButton(text=PRACTICE_TEXT)],
+            [KeyboardButton(text=RESUME_TEXT if paused else PAUSE_TEXT)],
         ],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Tap GET MORE or Practice",
+        input_field_placeholder="Tap GET MORE, Practice or Pause",
     )
 
 
@@ -409,7 +416,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         "• /level — уровень сложности (простой/средний/сложный)\n"
         "• /time — настроить время отправки 🕒\n"
         "• по умолчанию патч приходит раз в день в случайное время",
-        reply_markup=_patch_keyboard(),
+        reply_markup=_patch_keyboard(paused=user.get("is_paused")),
     )
 
 
@@ -490,6 +497,26 @@ async def cmd_patch(message: Message, bot: Bot) -> None:
 @router.message(F.text == PATCH_NOW_TEXT)
 async def on_patch_button(message: Message, bot: Bot) -> None:
     await send_patch_now(message, bot)
+
+
+@router.message(F.text == PAUSE_TEXT)
+@router.message(F.text == RESUME_TEXT)
+async def on_pause_button(message: Message, bot: Bot) -> None:
+    """Toggle scheduled patch delivery on/off; manual patches still work."""
+    db.upsert_user(message.from_user.id)
+    user = db.get_user(message.from_user.id)
+    if user.get("is_paused"):
+        db.set_user_paused(message.from_user.id, False)
+        await message.answer(
+            "Патчи снова активны — присылать по расписанию 🎧",
+            reply_markup=_patch_keyboard(paused=False),
+        )
+    else:
+        db.set_user_paused(message.from_user.id, True)
+        await message.answer(
+            "Патчи на паузе. Запросить патч или потренироваться всё ещё можно ⏸",
+            reply_markup=_patch_keyboard(paused=True),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -935,7 +962,11 @@ async def cmd_stats(message: Message, bot: Bot) -> None:
     lines = [f"📊 <b>Пользователи ({len(users)})</b> — время в {settings.timezone}"]
     for u in users:
         name = await _display_name(bot, u["user_id"])
-        flags = "" if u["is_active"] else " · 🚫 заблокировал"
+        flags = ""
+        if not u["is_active"]:
+            flags += " · 🚫 заблокировал"
+        if u.get("is_paused") and u["is_active"]:
+            flags += " · ⏸ на паузе"
         lines.append(
             f"\n<b>{name}</b> <code>{u['user_id']}</code>{flags}\n"
             f"{_language_label(u['language'])} · {_difficulty_label(u.get('difficulty'))} · "
