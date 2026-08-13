@@ -48,7 +48,8 @@ def init_db(db_path: Path | None = None) -> None:
                 native_language TEXT    NOT NULL,
                 difficulty      TEXT,
                 send_time       TEXT,
-                awaiting_time   INTEGER NOT NULL DEFAULT 0
+                awaiting_time   INTEGER NOT NULL DEFAULT 0,
+                is_paused       INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS content_pool (
@@ -107,6 +108,7 @@ def init_db(db_path: Path | None = None) -> None:
                 "difficulty": "TEXT",
                 "send_time": "TEXT",
                 "awaiting_time": "INTEGER NOT NULL DEFAULT 0",
+                "is_paused": "INTEGER NOT NULL DEFAULT 0",
             },
         )
         _add_missing_columns(conn, "content_pool", {"difficulty": "TEXT"})
@@ -274,6 +276,11 @@ def upsert_user(user_id: int) -> None:
 def set_user_active(user_id: int, active: bool) -> None:
     with _connect() as conn:
         conn.execute("UPDATE users SET is_active = ? WHERE user_id = ?", (1 if active else 0, user_id))
+
+
+def set_user_paused(user_id: int, paused: bool) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE users SET is_paused = ? WHERE user_id = ?", (1 if paused else 0, user_id))
 
 
 def set_user_language(user_id: int, language: str) -> None:
