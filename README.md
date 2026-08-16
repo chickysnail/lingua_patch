@@ -85,6 +85,19 @@ and `railway.json` are included.
 
 No healthcheck/port is needed — it's a worker, not a web service.
 
+## Knowing when the bot is down
+
+A worker with no port cannot be probed, and it sits silent between patches anyway,
+so a crash looks exactly like a quiet day. Two signals instead:
+
+- The admin gets a DM on startup (🟢) and on a clean shutdown (🔴) — that covers
+  redeploys.
+- A crash cannot report itself, so the bot pings `HEARTBEAT_URL` every
+  `HEARTBEAT_INTERVAL_SECONDS`; when the pings stop, the monitor alerts you. Create
+  a heartbeat ("cron"/"push") monitor at
+  [Better Stack](https://betterstack.com/uptime), UptimeRobot or Healthchecks.io,
+  give it a few minutes of grace, and paste its ping URL into `HEARTBEAT_URL`.
+
 ## Commands
 
 | Command / button        | Who      | What |
@@ -113,6 +126,7 @@ All settings come from environment variables / `.env` — see
 | `formatting.py`       | Builds the scannable Telegram message. |
 | `generate_content.py` | Standalone seeding script. |
 | `main.py`             | Bot handlers + APScheduler daily job. |
+| `monitoring.py`       | Heartbeat pings for downtime alerts. |
 
 ## Attribution
 
