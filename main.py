@@ -45,6 +45,7 @@ import speaking
 from config import settings
 from formatting import build_message, vocab_list
 from languages import LANGUAGES, get, is_supported
+from monitoring import Heartbeat
 from tts import NoNativeVoiceError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -1108,6 +1109,15 @@ async def maybe_seed_on_start(bot: Bot) -> None:
         await _expand_pool(bot, code, settings.native_language, need)
 
 
+async def _notify_admin(bot: Bot, text: str) -> None:
+    if not settings.admin_id:
+        return
+    try:
+        await bot.send_message(settings.admin_id, text)
+    except Exception:  # noqa: BLE001
+        log.warning("Failed to send %r to the admin.", text)
+
+
 async def main() -> None:
     if not settings.bot_token:
         raise SystemExit("BOT_TOKEN is not set. Add it to the environment or .env file.")
@@ -1136,9 +1146,23 @@ async def main() -> None:
         settings.timezone, run_at.isoformat(), len(fixed), db.count_content(),
     )
 
+    # Pings an external monitor while alive; a crash stops the pings and the
+    # monitor is what raises the alert.
+    heartbeat = Heartbeat(settings.heartbeat_url, settings.heartbeat_interval_seconds)
+    heartbeat.start()
+    now = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d %H:%M:%S %Z")
+    await _notify_admin(bot, f"\U0001f7e2 Bot started at {now}")
+
     try:
         await dp.start_polling(bot)
     finally:
+        # A clean shutdown (redeploy, SIGTERM) is announced here; a crash is caught
+        # by the heartbeat monitor instead.
+        stopped_at = datetime.now(ZoneInfo(settings.timezone)).strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+        await _notify_admin(bot, f"\U0001f534 Bot shutting down at {stopped_at}")
+        await heartbeat.stop()
         scheduler.shutdown(wait=False)
         await bot.session.close()
 

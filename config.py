@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     db_path: Path = BASE_DIR / "bot.db"
     media_dir: Path = BASE_DIR / "media"
 
+    # Heartbeat monitor URL (Better Stack / UptimeRobot / Healthchecks.io) pinged
+    # while the bot is alive; the monitor alerts when the pings stop. Empty
+    # disables the heartbeat.
+    heartbeat_url: str = ""
+    heartbeat_interval_seconds: int = 60
+
     # Optional auto-seed on startup: comma-separated target codes (e.g. "ukr,spa").
     # On boot, any listed language whose pool has fewer than seed_count items is
     # topped up via AI generation. Leave empty to disable.
