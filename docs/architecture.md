@@ -3,7 +3,7 @@
 Living document. Update it in the same PR as any change to schema, data flow,
 or external services. Written so the owner can read it without reading Python.
 
-Last synced with code: commit `98c4535` (PR #35, downtime alerts).
+Last synced with code: commit `c5a3153` (PR #36, docs: add AGENTS.md, architecture, workflow spec).
 
 ## 1. One-paragraph model
 
@@ -151,13 +151,19 @@ see Known issues #1.
 | ElevenLabs STT | scribe | every voice reply | per second of audio |
 | Telegram | — | everything | free |
 
-There is no per-user rate limit or daily quota anywhere. The biggest unbounded
-vector: toggling `/level` or `/language` back and forth re-triggers
-`_maybe_expand` each time, and a freshly-selected tier/language starts at 0
-unseen items, so every toggle can fire a full `topup_count` (default 10)
-batch — 10 OpenAI calls plus 10 ElevenLabs TTS calls — with no cooldown
-between toggles. A single user tapping "Practice" repeatedly or holding a
-long conversation spends without bound the same way.
+There is no per-user rate limit or daily quota anywhere. Pool expansion itself
+is bounded, not a loop: `_maybe_expand` only fires while a user's unseen count
+for a `(language, difficulty)` tier is ≤ `topup_threshold` (5), and
+`_expand_pool` holds a per-tier lock, so repeated `/level`/`/language`
+toggling does not refire once a tier is stocked. Worst case is one
+`topup_count` (10) batch per tier — 16 languages × 4 tiers ≈ 640 items total —
+a bounded, one-time cost shared across every user, not an unbounded per-user
+spend.
+
+The actual unbounded vector is the practice conversation: every learner turn
+(voice or text) costs one `gpt-4o` call carrying up to 20 turns of history,
+per user, with no daily cap. A user holding a long conversation, or tapping
+"Practice" repeatedly, spends without bound.
 
 ## 6. Deployment & ops
 
@@ -182,24 +188,32 @@ long conversation spends without bound the same way.
    no setter or handler ever updates it — it's fixed at registration from the
    deploy-time `settings.native_language` and stays that way for the account's
    whole lifetime.
-4. **No cost limits** — see §5.
-5. **Pool expansion has no cooldown or cap across its six entry points**
-   (`deliver`, `send_patch_now`, `cmd_start`, `cmd_language`, `on_set_language`,
-   `on_set_level`). Toggling `/level` or `/language` repeatedly can fire
-   unlimited full-size (`topup_count`) batches back to back.
-6. **No automated tests / evals.** Prompt regressions are only caught by using
+4. **`native_language` is passed inconsistently.** `main.py:436` (`cmd_language`)
+   and `main.py:451` (`on_set_language`) pass `settings.native_language` into
+   `_maybe_expand` instead of the user's stored `native_language` — every other
+   call site uses `user.get("native_language", settings.native_language)`.
+   Harmless while the field is frozen (#3 above), but a real bug the moment
+   `native_language` becomes user-settable.
+5. **No cost limits** — see §5.
+6. **Pool expansion is bounded, not unbounded.** `_maybe_expand` only fires
+   while a tier's unseen count is ≤ `topup_threshold`, and `_expand_pool` is
+   locked per `(language, difficulty)`, so toggling `/level`/`/language` does
+   not refire once a tier is stocked. Worst case is one `topup_count` batch per
+   tier — 16 languages × 4 tiers ≈ 640 items total — a bounded, one-time,
+   shared cost. The real unbounded cost is the practice conversation (#5/§5).
+7. **No automated tests / evals.** Prompt regressions are only caught by using
    the bot.
-7. **Daily-send atomicity.** `send_and_reschedule` writes `last_daily_date`
+8. **Daily-send atomicity.** `send_and_reschedule` writes `last_daily_date`
    *before* the loop; a crash mid-loop marks the day sent for everyone.
-8. **`asyncio.create_task` without a reference** in `_maybe_expand` — task can be
+9. **`asyncio.create_task` without a reference** in `_maybe_expand` — task can be
    garbage-collected mid-flight. Keep a set of pending tasks.
-9. **Hand-rolled FSM** (`awaiting_time` column). Fine for one flag; will not scale
-   to lessons. aiogram FSM exists.
-10. **Media never cleaned up**; `used_count` is written but never read.
-11. **Legacy contrastive vocabulary.** The "words most different from the native
+10. **Hand-rolled FSM** (`awaiting_time` column). Fine for one flag; will not
+    scale to lessons. aiogram FSM exists.
+11. **Media never cleaned up**; `used_count` is written but never read.
+12. **Legacy contrastive vocabulary.** The "words most different from the native
     language" idea in `content.py`'s prompt is a leftover from the ukr-from-rus
     origin. Owner has said it is no longer a product goal.
-12. `.env.example` ships a real-looking `ADMIN_ID`. Should be `0`.
+13. `.env.example` ships a real-looking `ADMIN_ID`. Should be `0`.
 
 ## 8. Roadmap (owner intent, not commitments)
 
