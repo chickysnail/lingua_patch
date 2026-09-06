@@ -3,7 +3,7 @@
 Living document. Update it in the same PR as any change to schema, data flow,
 or external services. Written so the owner can read it without reading Python.
 
-Last synced with code: commit `98c4535` (PR #35, downtime alerts).
+Last synced with code: commit `c5a3153` (PR #36, docs: add AGENTS.md, architecture, workflow spec).
 
 ## 1. One-paragraph model
 
@@ -22,10 +22,10 @@ learner's voice is transcribed with ElevenLabs STT.
 | `main.py` | Telegram handlers, scheduler, delivery loop, practice flow orchestration | everything below |
 | `db.py` | SQLite schema, migrations, all queries | sqlite |
 | `content.py` | patch text generation prompt, mp3→ogg, YouGlish links | OpenAI |
-| `generate_content.py` | `seed()` — the pool-filling loop; also a CLI | content, tts, db |
+| `generate_content.py` | `seed()` — the pool-filling loop; also a CLI | content, tts, db, OpenAI |
 | `tts.py` | ElevenLabs TTS, curated native voice pools per language | ElevenLabs |
-| `speaking.py` | practice prompts, STT, response parsing, rich-message HTML | OpenAI, ElevenLabs STT |
-| `formatting.py` | HTML for the daily patch message | — |
+| `speaking.py` | practice prompts, STT, response parsing, rich-message HTML | OpenAI, ElevenLabs STT, content.py (`THEMES`) |
+| `formatting.py` | HTML for the daily patch message | content.py, languages.py |
 | `languages.py` | supported languages, ISO codes, YouGlish slugs | — |
 | `config.py` | env-based `Settings` (pydantic) | — |
 | `monitoring.py` | heartbeat pings to an external uptime monitor | httpx |
@@ -42,7 +42,7 @@ scheduler fires (random time in window, or per-user cron)
   → deliver(user)
       → db.pick_unsent_content(user, language, difficulty)   # random unseen row
       → send_voice(ogg) + send_message(html, "Let's practice" button)
-      → db.record_sent, db.clear_active_exercise
+      → db.clear_active_exercise, db.record_sent
       → _maybe_expand: if unseen ≤ topup_threshold → background seed()
 ```
 
@@ -52,14 +52,26 @@ Two scheduling paths coexist:
   `TIMEZONE`; `meta.last_daily_date` guards against double sends.
 - **Fixed time** (`/time`): one APScheduler cron job per user, restored on boot.
 
+`_maybe_expand` is not delivery-only — it is called from six sites: `deliver`,
+`send_patch_now`, `cmd_start`, `cmd_language`, `on_set_language`, and
+`on_set_level`. So `/start`, `/language` and `/level` can each independently
+trigger a background pool-expansion batch, not just the scheduled send.
+
+Tapping "Let's practice" on a patch also feeds that patch's vocabulary into
+the practice exercise: `_patch_vocabulary(content)` pulls its words and passes
+them into `_start_practice(..., vocabulary_hint=...)`, so the generated
+sentence reuses one or two words the learner just heard (see §3.3).
+
 ### 3.2 Pool expansion (`generate_content.seed`)
 
 ```
-for i in range(count):
+while inserted < count and attempts < count * 3:
     OpenAI(gpt-4o-mini) → {transcript, translation, vocabulary[3-5], theme}
     ElevenLabs TTS (random native voice) → mp3
     ffmpeg → ogg (32k opus)
     db.insert_content(...)
+    # a failed attempt (bad snippet JSON, TTS error) is skipped and retried
+    # within the attempts budget, without counting toward `inserted`
 ```
 Runs in a thread; de-duplicated per `(language, difficulty)` so concurrent
 triggers don't double-generate. Themes are a hardcoded list of ~30 everyday topics.
@@ -74,10 +86,20 @@ tap "Practice" / "Let's practice"
   → notes stored as a "tutor" turn
 learner sends voice / text
   → STT (ElevenLabs scribe) if voice
-  → speaking.respond(source_sentence, turns[:20], ...)  → {verdict, reply, notes?}
+  → speaking.respond(source_sentence, turns, ...)  → {verdict, reply, notes?}
+      # only the most recent 20 turns (MAX_HISTORY_TURNS) go to the model
   → turns appended; reply + optional notes sent
 ```
 The exercise lives until the next practice or the next delivered patch.
+
+**Rich messages, with a fallback.** The task and theory are sent via
+Telegram's `SendRichMessage`/`EditMessageText` API (`InputRichMessage`) so the
+theory's collapsible blocks (`<details>`, tables) render properly. If Telegram
+rejects the rich message (`TelegramBadRequest`), `main.py` falls back to plain
+HTML built by `speaking.build_*_fallback_html`, which renders each block as an
+expandable blockquote instead of `<details>`/`<table>`. Every rich send in the
+practice flow — the task, the theory, and any mid-conversation notes — has a
+matching fallback path.
 
 ## 4. Schema (SQLite, `db.py:init_db`)
 
@@ -105,6 +127,11 @@ active_exercises (user_id PK, source_sentence, language, native_language,
 meta (key, value)                                  # last_daily_date
 ```
 
+`native_language` has no setter: it is written once, at `upsert_user()`, from
+`settings.native_language` (a deploy-time constant, default `rus`). No command
+or handler ever updates it for an existing user — despite the per-row column,
+it currently behaves as a fixed, bot-wide value.
+
 Migrations are ad hoc: `_add_missing_columns()` for additive changes, one
 table-rebuild helper for a legacy column drop. There is no migration version
 table.
@@ -124,8 +151,19 @@ see Known issues #1.
 | ElevenLabs STT | scribe | every voice reply | per second of audio |
 | Telegram | — | everything | free |
 
-There is no per-user rate limit or daily quota anywhere. A single user tapping
-"Practice" repeatedly or holding a long conversation spends without bound.
+There is no per-user rate limit or daily quota anywhere. Pool expansion itself
+is bounded, not a loop: `_maybe_expand` only fires while a user's unseen count
+for a `(language, difficulty)` tier is ≤ `topup_threshold` (5), and
+`_expand_pool` holds a per-tier lock, so repeated `/level`/`/language`
+toggling does not refire once a tier is stocked. Worst case is one
+`topup_count` (10) batch per tier — 16 languages × 4 tiers ≈ 640 items total —
+a bounded, one-time cost shared across every user, not an unbounded per-user
+spend.
+
+The actual unbounded vector is the practice conversation: every learner turn
+(voice or text) costs one `gpt-4o` call carrying up to 20 turns of history,
+per user, with no daily cap. A user holding a long conversation, or tapping
+"Practice" repeatedly, spends without bound.
 
 ## 6. Deployment & ops
 
@@ -146,20 +184,36 @@ There is no per-user rate limit or daily quota anywhere. A single user tapping
 2. **Timezone is global.** `TIMEZONE` is one value for the whole bot; `/time`
    stores wall-clock in that zone. Users outside it get patches at the wrong time.
    (`config.py` defaults to Europe/Moscow, `.env.example` says Europe/Kyiv.)
-3. **No cost limits** — see §5.
-4. **No automated tests / evals.** Prompt regressions are only caught by using
+3. **`native_language` is not user-changeable.** The column exists per-row, but
+   no setter or handler ever updates it — it's fixed at registration from the
+   deploy-time `settings.native_language` and stays that way for the account's
+   whole lifetime.
+4. **`native_language` is passed inconsistently.** `main.py:436` (`cmd_language`)
+   and `main.py:451` (`on_set_language`) pass `settings.native_language` into
+   `_maybe_expand` instead of the user's stored `native_language` — every other
+   call site uses `user.get("native_language", settings.native_language)`.
+   Harmless while the field is frozen (#3 above), but a real bug the moment
+   `native_language` becomes user-settable.
+5. **No cost limits** — see §5.
+6. **Pool expansion is bounded, not unbounded.** `_maybe_expand` only fires
+   while a tier's unseen count is ≤ `topup_threshold`, and `_expand_pool` is
+   locked per `(language, difficulty)`, so toggling `/level`/`/language` does
+   not refire once a tier is stocked. Worst case is one `topup_count` batch per
+   tier — 16 languages × 4 tiers ≈ 640 items total — a bounded, one-time,
+   shared cost. The real unbounded cost is the practice conversation (#5/§5).
+7. **No automated tests / evals.** Prompt regressions are only caught by using
    the bot.
-5. **Daily-send atomicity.** `send_and_reschedule` writes `last_daily_date`
+8. **Daily-send atomicity.** `send_and_reschedule` writes `last_daily_date`
    *before* the loop; a crash mid-loop marks the day sent for everyone.
-6. **`asyncio.create_task` without a reference** in `_maybe_expand` — task can be
+9. **`asyncio.create_task` without a reference** in `_maybe_expand` — task can be
    garbage-collected mid-flight. Keep a set of pending tasks.
-7. **Hand-rolled FSM** (`awaiting_time` column). Fine for one flag; will not scale
-   to lessons. aiogram FSM exists.
-8. **Media never cleaned up**; `used_count` is written but never read.
-9. **Legacy contrastive vocabulary.** The "words most different from the native
-   language" idea in `content.py`'s prompt is a leftover from the ukr-from-rus
-   origin. Owner has said it is no longer a product goal.
-10. `.env.example` ships a real-looking `ADMIN_ID`. Should be `0`.
+10. **Hand-rolled FSM** (`awaiting_time` column). Fine for one flag; will not
+    scale to lessons. aiogram FSM exists.
+11. **Media never cleaned up**; `used_count` is written but never read.
+12. **Legacy contrastive vocabulary.** The "words most different from the native
+    language" idea in `content.py`'s prompt is a leftover from the ukr-from-rus
+    origin. Owner has said it is no longer a product goal.
+13. `.env.example` ships a real-looking `ADMIN_ID`. Should be `0`.
 
 ## 8. Roadmap (owner intent, not commitments)
 
