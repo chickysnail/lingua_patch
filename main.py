@@ -41,6 +41,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 import db
+import memory
 import speaking
 from config import settings
 from formatting import build_message, vocab_list
@@ -141,6 +142,57 @@ def _maybe_expand(
 
 
 # --------------------------------------------------------------------------- #
+# Tutor memory (background update at the end of every practice session)
+# --------------------------------------------------------------------------- #
+# Kept referenced so a pending update is never garbage-collected mid-flight
+# (see Known issue #9 for the same bug already present in _maybe_expand).
+_memory_update_tasks: set[asyncio.Task] = set()
+
+
+async def _update_memory(user_id: int, exercise: dict[str, Any]) -> None:
+    """Fold one ended session's turns into the learner's tutor memory.
+
+    Never raises: an update-call failure or a malformed response is logged
+    and the previous memory is left exactly as it was.
+    """
+    language = exercise["language"]
+    native = exercise["native_language"]
+    turns = exercise.get("turns", [])[-speaking.MAX_HISTORY_TURNS:]
+    current = db.get_tutor_memory(user_id, language)
+    try:
+        updated = await asyncio.to_thread(
+            memory.update_memory, current, turns, language, native
+        )
+    except Exception:
+        log.exception(
+            "Tutor memory update failed for user %s (language=%s); keeping old memory.",
+            user_id, language,
+        )
+        return
+    if updated != current:
+        db.save_tutor_memory(user_id, language, updated)
+
+
+def _schedule_memory_update(user_id: int) -> None:
+    """Fire-and-forget: update tutor memory from the exercise about to be wiped.
+
+    Must be called before the caller overwrites/deletes ``active_exercises``
+    for this user. Skipped when there is nothing to learn from — no active
+    exercise, or one the learner never answered — so ending an unstarted
+    exercise costs nothing.
+    """
+    exercise = db.get_active_exercise(user_id)
+    if exercise is None:
+        return
+    if not any(turn.get("role") == "learner" for turn in exercise.get("turns", [])):
+        return
+
+    task = asyncio.create_task(_update_memory(user_id, exercise))
+    _memory_update_tasks.add(task)
+    task.add_done_callback(_memory_update_tasks.discard)
+
+
+# --------------------------------------------------------------------------- #
 # Core delivery
 # --------------------------------------------------------------------------- #
 async def deliver(bot: Bot, user: dict[str, Any], scheduled: bool = False) -> bool:
@@ -190,7 +242,9 @@ async def deliver(bot: Bot, user: dict[str, Any], scheduled: bool = False) -> bo
         log.exception("Failed to deliver to %s", user_id)
         return False
 
-    # A delivered patch ends the practice session that was running, if any.
+    # A delivered patch ends the practice session that was running, if any —
+    # fold it into tutor memory before that session's turns are gone for good.
+    _schedule_memory_update(user_id)
     db.clear_active_exercise(user_id)
     db.record_sent(user_id, content["id"])
     _maybe_expand(bot, user_id, language, native, difficulty)
@@ -416,6 +470,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         "• /language — сменить язык\n"
         "• /level — уровень сложности (простой/средний/сложный)\n"
         "• /time — настроить время отправки 🕒\n"
+        "• /memory — что помнит преподаватель про тебя 🧠\n"
         "• по умолчанию патч приходит раз в день в случайное время",
         reply_markup=_patch_keyboard(paused=user.get("is_paused")),
     )
@@ -644,9 +699,12 @@ async def _start_practice(
 
     _generating_exercises.add(user_id)
     try:
+        tutor_memory = db.get_tutor_memory(user_id, language)
         try:
             source_sentence = await asyncio.to_thread(
-                speaking.generate_sentence, language, native, difficulty, vocabulary_hint
+                speaking.generate_sentence,
+                language, native, difficulty, vocabulary_hint,
+                tutor_memory,
             )
         except Exception:
             log.exception("Failed to generate exercise for user %s", user_id)
@@ -664,6 +722,10 @@ async def _start_practice(
             await bot.send_message(user_id, "Не удалось отправить упражнение. Попробуй ещё раз.")
             return
 
+        # A new exercise ends the previous one — fold it into tutor memory
+        # before set_active_exercise wipes its turns.
+        _schedule_memory_update(user_id)
+
         # The answer is accepted from now on, theory or not.
         exercise_state = {
             "source_sentence": source_sentence,
@@ -675,7 +737,9 @@ async def _start_practice(
         status = await bot.send_message(user_id, speaking.hints_pending_text(native))
         try:
             exercise = await asyncio.to_thread(
-                speaking.generate_theory, language, native, source_sentence, difficulty
+                speaking.generate_theory,
+                language, native, source_sentence, difficulty,
+                tutor_memory,
             )
         except Exception:
             log.exception("Failed to generate theory for user %s", user_id)
@@ -738,6 +802,25 @@ async def cmd_practice(message: Message, bot: Bot) -> None:
     await _start_practice(message.from_user.id, bot)
 
 
+@router.message(Command("memory"))
+async def cmd_memory(message: Message) -> None:
+    """Read-only: show what the tutor has learned about this learner so far.
+
+    The only way to see whether tutor memory works at all, and to catch the
+    tutor believing something false — editing it by hand is not supported.
+    """
+    db.upsert_user(message.from_user.id)
+    user = db.get_user(message.from_user.id)
+    text = db.get_tutor_memory(message.from_user.id, user["language"])
+    if not text:
+        await message.answer(
+            "Пока пусто — я ничего не запомнил про тебя для этого языка. "
+            "Пройди практику, и после неё здесь что-то появится."
+        )
+        return
+    await message.answer(f"🧠 <b>Что я помню</b>\n\n<pre>{html.escape(text)}</pre>")
+
+
 @router.message(F.text == PRACTICE_TEXT)
 async def on_practice_button(message: Message, bot: Bot) -> None:
     """Persistent reply-keyboard 'Practice' button."""
@@ -793,6 +876,7 @@ async def _reply_in_session(
             turns,
             exercise["language"],
             native,
+            db.get_tutor_memory(user_id, exercise["language"]),
         )
     except Exception:
         log.exception("Practice reply failed for user %s", user_id)
@@ -1083,6 +1167,7 @@ async def setup_commands(bot: Bot) -> None:
             BotCommand(command="language", description="Сменить изучаемый язык"),
             BotCommand(command="level", description="Уровень сложности 📶"),
             BotCommand(command="time", description="Настроить время патча 🕒"),
+            BotCommand(command="memory", description="Что помнит преподаватель 🧠"),
             BotCommand(command="start", description="Начать / показать текущий язык"),
         ]
     )

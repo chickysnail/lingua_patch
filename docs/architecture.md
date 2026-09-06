@@ -24,7 +24,8 @@ learner's voice is transcribed with ElevenLabs STT.
 | `content.py` | patch text generation prompt, mp3→ogg, YouGlish links | OpenAI |
 | `generate_content.py` | `seed()` — the pool-filling loop; also a CLI | content, tts, db, OpenAI |
 | `tts.py` | ElevenLabs TTS, curated native voice pools per language | ElevenLabs |
-| `speaking.py` | practice prompts, STT, response parsing, rich-message HTML | OpenAI, ElevenLabs STT, content.py (`THEMES`) |
+| `speaking.py` | practice prompts, STT, response parsing, rich-message HTML | OpenAI, ElevenLabs STT, content.py (`THEMES`), memory.py |
+| `memory.py` | tutor memory document: fixed sections, size caps, delta application, the update prompt, prompt-injection formatting | OpenAI |
 | `formatting.py` | HTML for the daily patch message | content.py, languages.py |
 | `languages.py` | supported languages, ISO codes, YouGlish slugs | — |
 | `config.py` | env-based `Settings` (pydantic) | — |
@@ -80,17 +81,55 @@ triggers don't double-generate. Themes are a hardcoded list of ~30 everyday topi
 
 ```
 tap "Practice" / "Let's practice"
-  → speaking.generate_sentence   (native-language sentence, gpt-4o)   → sent immediately
+  → main._schedule_memory_update (background; folds the PREVIOUS exercise, if
+      any learner turn is in it, into tutor_memory before it is overwritten)
+  → speaking.generate_sentence   (native-language sentence, gpt-4o, + tutor_memory) → sent immediately
   → db.set_active_exercise       (wipes previous exercise)
-  → speaking.generate_theory     (collapsible "blocks", gpt-4o)       → edited into task msg
+  → speaking.generate_theory     (collapsible "blocks", gpt-4o, + tutor_memory)     → edited into task msg
   → notes stored as a "tutor" turn
 learner sends voice / text
   → STT (ElevenLabs scribe) if voice
-  → speaking.respond(source_sentence, turns, ...)  → {verdict, reply, notes?}
+  → speaking.respond(source_sentence, turns, ..., tutor_memory)  → {verdict, reply, notes?}
       # only the most recent 20 turns (MAX_HISTORY_TURNS) go to the model
   → turns appended; reply + optional notes sent
 ```
-The exercise lives until the next practice or the next delivered patch.
+The exercise lives until the next practice or the next delivered patch. Either
+event also ends the session for tutor-memory purposes: `main._schedule_memory_update`
+reads the exercise about to be overwritten/wiped, and — only if the learner
+actually answered at least once — runs one background `memory.update_memory`
+call (§3.4) before the old turns are gone.
+
+### 3.4 Tutor memory (`memory.py`, `db.tutor_memory`)
+
+One short markdown document per `(user_id, language)`, capped in size,
+injected into the three prompts above so the tutor has an approximate,
+persistent picture of the learner instead of starting from zero every
+session. Full design: `docs/specs/001-tutor-memory.md`.
+
+```
+session ends (deliver() or a new practice starts)
+  → main._schedule_memory_update(user_id)
+      skip if no active exercise, or the learner never sent a turn in it
+      → memory.update_memory(current_memory, turns, language, native)
+          → memory.generate_update  (gpt-4o call) → {"add": [...], "remove": [...]}
+          → memory.apply_delta      (pure; enforces the caps, drops oldest-first)
+      → db.save_tutor_memory (old value kept as memory_prev)
+```
+
+The document has five fixed English headers (`## Level`, `## Recurring
+errors`, `## Recent wins`, `## About the learner`, `## How to teach them`);
+prose inside is in the learner's native language. No word list — that is the
+part that grows without bound, deliberately left to a future SRS spec (§8).
+The updater is asked for a delta, never a rewrite, so one bad generation
+cannot silently erase the document; `apply_delta` also refuses anything that
+doesn't name one of the five fixed sections, which is what keeps a learner's
+turn like "ignore the rules above" from doing anything beyond being a plain
+inert fact of the conversation.
+
+`memory.format_for_prompt` renders '' for an empty memory, so a learner with
+none yet gets prompts byte-identical to before this feature existed. `/memory`
+is a read-only command that prints the current document — the only way to see
+whether it works, or to catch the tutor believing something false.
 
 **Rich messages, with a fallback.** The task and theory are sent via
 Telegram's `SendRichMessage`/`EditMessageText` API (`InputRichMessage`) so the
@@ -124,6 +163,13 @@ content_pool
 sent_history (user_id, content_id, sent_at)      # the "never repeat" ledger
 active_exercises (user_id PK, source_sentence, language, native_language,
                   created_at, turns_json)          # ONE per user; overwritten
+
+tutor_memory (user_id, language) PK
+  memory      TEXT NOT NULL DEFAULT ''    markdown, fixed sections, capped (~3000 chars)
+  memory_prev TEXT NULL                    the version before the last update
+  updated_at  TEXT NULL
+                                            # one row per learner per target language;
+                                            # see §3.4 and docs/specs/001-tutor-memory.md
 meta (key, value)                                  # last_daily_date
 ```
 
@@ -133,13 +179,16 @@ or handler ever updates it for an existing user — despite the per-row column,
 it currently behaves as a fixed, bot-wide value.
 
 Migrations are ad hoc: `_add_missing_columns()` for additive changes, one
-table-rebuild helper for a legacy column drop. There is no migration version
-table.
+table-rebuild helper for a legacy column drop, `CREATE TABLE IF NOT EXISTS` for
+a brand-new table like `tutor_memory`. There is no migration version table.
 
-**What the schema does NOT know:** which words a learner has seen, which they
-got wrong, when anything is due. Vocabulary is opaque JSON on the content row.
-Practice history is overwritten each session. This is the main structural gap —
-see Known issues #1.
+**What the schema does NOT know:** which specific words a learner has seen,
+which they got wrong, when anything is due — there is no per-word state, so
+spaced repetition still cannot be built without a schema redesign. Vocabulary
+stays opaque JSON on the content row. `tutor_memory` (above) closes the other
+half of the old gap: an approximate, persistent picture of the learner now
+survives between sessions, even though nothing tracks individual words. See
+Known issues #1.
 
 ## 5. External services & cost surface
 
@@ -147,6 +196,7 @@ see Known issues #1.
 |---|---|---|---|
 | OpenAI | gpt-4o-mini | pool expansion | per patch, ~1 call |
 | OpenAI | gpt-4o | practice: sentence, theory, **every learner turn** (with up to 20-turn history) | per tap; unbounded per user |
+| OpenAI | gpt-4o | tutor memory update, once per *completed* session (§3.4) | per session that had ≥1 learner turn, not per turn |
 | ElevenLabs TTS | multilingual_v2 | pool expansion | per patch, per character |
 | ElevenLabs STT | scribe | every voice reply | per second of audio |
 | Telegram | — | everything | free |
@@ -165,6 +215,11 @@ The actual unbounded vector is the practice conversation: every learner turn
 per user, with no daily cap. A user holding a long conversation, or tapping
 "Practice" repeatedly, spends without bound.
 
+Tutor memory adds one more `gpt-4o` call, but bounded the other way: at most
+once per *session* (not per turn), skipped entirely for a session with no
+learner turn, and the document itself is capped in size (§3.4) so the call's
+input never grows with usage the way per-turn history does.
+
 ## 6. Deployment & ops
 
 - Railway worker from `Dockerfile` (python:3.12-slim + ffmpeg). No port.
@@ -173,14 +228,21 @@ per user, with no daily cap. A user holding a long conversation, or tapping
   `ELEVENLABS_API_KEY` (+ optional STT key).
 - Observability: admin DM on start/stop; heartbeat URL pinged every 60 s;
   `/stats` admin command. No structured metrics, no error aggregation.
-- Testing: none automated. `.agents/skills/testing-lingua-patch/SKILL.md`
-  describes a manual/mocked procedure. `ruff` passes.
+- Testing: `tests/` (pytest) covers `db.py` and the pure/mockable parts of
+  `memory.py`, `speaking.py` and `main.py` — no prompt-quality checks, that
+  needs the eval harness (§8, still its own spec).
+  `.agents/skills/testing-lingua-patch/SKILL.md` describes a manual/mocked
+  procedure for everything else. `ruff` passes.
 
 ## 7. Known issues (ordered by how much they block the roadmap)
 
-1. **No learner model.** No `word` / `user_word_state` / attempts tables →
-   spaced repetition and any "what does this person know" logic cannot be built
-   without a schema redesign. Do this before adding lesson-type features.
+1. **No per-word learner model.** `tutor_memory` (§3.4) now gives the tutor an
+   approximate, persistent picture of the learner — level, recurring errors,
+   what they care about — but there is still no `word` / `user_word_state` /
+   attempts table. "Which of these 40 words is due today" is arithmetic over
+   dates that prose cannot answer reliably, so spaced repetition specifically
+   still needs a schema redesign before it can be built. Do this before
+   lesson/SRS-type features (§8).
 2. **Timezone is global.** `TIMEZONE` is one value for the whole bot; `/time`
    stores wall-clock in that zone. Users outside it get patches at the wrong time.
    (`config.py` defaults to Europe/Moscow, `.env.example` says Europe/Kyiv.)
@@ -201,8 +263,10 @@ per user, with no daily cap. A user holding a long conversation, or tapping
    not refire once a tier is stocked. Worst case is one `topup_count` batch per
    tier — 16 languages × 4 tiers ≈ 640 items total — a bounded, one-time,
    shared cost. The real unbounded cost is the practice conversation (#5/§5).
-7. **No automated tests / evals.** Prompt regressions are only caught by using
-   the bot.
+7. **No evals; unit tests now exist but are narrow.** `tests/` (bootstrapped by
+   the tutor-memory PR) covers schema, pure logic and prompt-injection points
+   with mocked clients — it cannot catch a prompt regression, only a code
+   regression. That still needs the eval harness (§8).
 8. **Daily-send atomicity.** `send_and_reschedule` writes `last_daily_date`
    *before* the loop; a crash mid-loop marks the day sent for everyone.
 9. **`asyncio.create_task` without a reference** in `_maybe_expand` — task can be

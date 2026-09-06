@@ -90,6 +90,16 @@ def init_db(db_path: Path | None = None) -> None:
                 turns_json      TEXT NOT NULL DEFAULT '[]'
             );
 
+            CREATE TABLE IF NOT EXISTS tutor_memory (
+                user_id     INTEGER NOT NULL,
+                language    TEXT    NOT NULL,
+                memory      TEXT    NOT NULL DEFAULT '',
+                memory_prev TEXT,
+                updated_at  TEXT,
+                PRIMARY KEY (user_id, language),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_content_language ON content_pool(language);
             CREATE INDEX IF NOT EXISTS idx_sent_user ON sent_history(user_id);
             """
@@ -236,6 +246,36 @@ def append_exercise_turns(user_id: int, turns: list[dict[str, str]]) -> None:
 def clear_active_exercise(user_id: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM active_exercises WHERE user_id = ?", (user_id,))
+
+
+# --------------------------------------------------------------------------- #
+# Tutor memory: one short markdown document per learner per target language.
+# --------------------------------------------------------------------------- #
+def get_tutor_memory(user_id: int, language: str) -> str:
+    """The learner's memory document for ``language``, or '' if none yet."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT memory FROM tutor_memory WHERE user_id = ? AND language = ?",
+            (user_id, language),
+        ).fetchone()
+        return row["memory"] if row else ""
+
+
+def save_tutor_memory(user_id: int, language: str, memory: str) -> None:
+    """Persist a new memory document, keeping the one it replaces as ``memory_prev``.
+
+    ``memory_prev`` is what makes one bad LLM-generated update recoverable
+    instead of permanent.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO tutor_memory (user_id, language, memory, memory_prev, updated_at) "
+            "VALUES (?, ?, ?, NULL, ?) "
+            "ON CONFLICT(user_id, language) DO UPDATE SET "
+            "memory_prev = tutor_memory.memory, memory = excluded.memory, "
+            "updated_at = excluded.updated_at",
+            (user_id, language, memory, _now()),
+        )
 
 
 # --------------------------------------------------------------------------- #
