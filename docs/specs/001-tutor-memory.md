@@ -1,6 +1,6 @@
 # 001 — Tutor memory
 
-Status: draft
+Status: accepted
 
 Supersedes the first draft of this spec (a four-table learner model: words,
 exposures, attempts, links). That approach is parked, not rejected — see
