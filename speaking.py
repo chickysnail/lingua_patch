@@ -28,6 +28,7 @@ from openai import OpenAI
 from config import settings
 from content import THEMES
 from languages import ENGLISH_NAMES, ISO_639_1, LANGUAGES, NATIVE_NAMES
+import memory
 
 log = logging.getLogger(__name__)
 
@@ -325,6 +326,7 @@ def generate_sentence(
     native_language: str,
     difficulty: str | None = None,
     vocabulary_hint: list[str] | None = None,
+    tutor_memory: str | None = None,
     client: OpenAI | None = None,
 ) -> str:
     """Generate only the sentence to translate.
@@ -336,6 +338,10 @@ def generate_sentence(
     so the exercise can reuse them. The patch text itself is never passed in:
     the learner already knows its translation, so an exercise built from it
     would be a memory test instead of a speaking one.
+
+    ``tutor_memory`` is what a previous session learned about this learner —
+    e.g. a weak spot to target, or what they care about, for a theme picked
+    over the ``THEMES`` fallback. Empty for a learner with no memory yet.
     """
     client = _client(client)
     target_name = _target_name(language)
@@ -357,6 +363,12 @@ def generate_sentence(
         f"Write the source sentence in {native_name}; the learner will translate it into "
         f"{target_name}."
     )
+    memory_block = memory.format_for_prompt(tutor_memory)
+    if memory_block:
+        parts.append(
+            "If it fits naturally, target a recurring error or lean on what this learner "
+            "cares about, per the memory below." + memory_block
+        )
 
     resp = client.chat.completions.create(
         model=settings.openai_exercise_model,
@@ -376,11 +388,14 @@ def generate_theory(
     native_language: str,
     source_sentence: str,
     difficulty: str | None = None,
+    tutor_memory: str | None = None,
     client: OpenAI | None = None,
 ) -> dict:
     """Write the notes the learner needs to say ``source_sentence`` themselves.
 
     The teacher chooses the blocks; nothing here dictates which topics appear.
+    ``tutor_memory`` lets the notes skip what this learner already knows and
+    lean into what they tend to get wrong. Empty for a learner with no memory yet.
     """
     client = _client(client)
     target_name = _target_name(language)
@@ -397,6 +412,12 @@ def generate_theory(
             "reveal the translated sentence."
         ),
     ]
+    memory_block = memory.format_for_prompt(tutor_memory)
+    if memory_block:
+        parts.append(
+            "Skip what this learner already knows and lean into their recurring errors, "
+            "per the memory below." + memory_block
+        )
 
     resp = client.chat.completions.create(
         model=settings.openai_exercise_model,
@@ -662,6 +683,7 @@ def respond(
     turns: list[dict[str, str]],
     language: str,
     native_language: str,
+    tutor_memory: str | None = None,
     client: OpenAI | None = None,
 ) -> dict:
     """Answer the learner's latest turn inside the running practice session.
@@ -670,6 +692,9 @@ def respond(
     item ``{"role": "learner"|"tutor", "kind": "voice"|"text"|"notes",
     "text": ...}`` — including the notes sent with the task, so the answer is
     judged against what this teacher actually taught.
+
+    ``tutor_memory`` is what a previous session learned about this learner;
+    empty for a learner with no memory yet.
 
     Returns ``{"verdict": ..., "reply": ..., "notes": ...}``: the verdict is
     ``"none"`` unless the latest turn was an attempt, and ``notes`` carries
@@ -680,7 +705,7 @@ def respond(
         native_name=_native_name(native_language),
         target_name=_target_name(language),
         source_sentence=source_sentence,
-    )
+    ) + memory.format_for_prompt(tutor_memory)
     resp = client.chat.completions.create(
         model=settings.openai_exercise_model,
         messages=_chat_messages(system, turns),
