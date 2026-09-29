@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # Stronger model for interactive speaking exercise generation/evaluation.
     openai_exercise_model: str = "gpt-4o"
 
+    # Free translation outside practice (OpenAI + ElevenLabs TTS per message):
+    # how many a user may start per day in the bot timezone.
+    translation_daily_limit: int = 30
+
     # Pool auto-expansion: when a user has <= topup_threshold unseen patches for
     # their language, a background job generates topup_count new items.
     topup_threshold: int = 5
