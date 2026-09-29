@@ -13,7 +13,9 @@ volume, and a `media/` folder of pre-generated OGG voice notes. Content is
 generated ahead of time into a **pool** (OpenAI text → ElevenLabs audio → ffmpeg
 to OGG) and handed out so that no user ever receives the same patch twice.
 Speaking practice is generated on demand (OpenAI) and graded turn by turn; the
-learner's voice is transcribed with ElevenLabs STT.
+learner's voice is transcribed with ElevenLabs STT. Outside practice, any voice
+or text message is translated into the learner's target language, explained if
+needed, and voiced back.
 
 ## 2. Modules
 
@@ -25,6 +27,7 @@ learner's voice is transcribed with ElevenLabs STT.
 | `generate_content.py` | `seed()` — the pool-filling loop; also a CLI | content, tts, db, OpenAI |
 | `tts.py` | ElevenLabs TTS, curated native voice pools per language | ElevenLabs |
 | `speaking.py` | practice prompts, STT, response parsing, rich-message HTML | OpenAI, ElevenLabs STT, content.py (`THEMES`) |
+| `translate.py` | free-translation prompt, parsing, HTML, voicing the translation | OpenAI, tts, content.py (`to_voice_ogg`) |
 | `formatting.py` | HTML for the daily patch message | content.py, languages.py |
 | `languages.py` | supported languages, ISO codes, YouGlish slugs | — |
 | `config.py` | env-based `Settings` (pydantic) | — |
@@ -101,6 +104,24 @@ expandable blockquote instead of `<details>`/`<table>`. Every rich send in the
 practice flow — the task, the theory, and any mid-conversation notes — has a
 matching fallback path.
 
+### 3.4 Free translation (outside practice)
+
+```
+learner sends voice, or text while not awaiting a /time value; no active exercise
+  → _claim_translation: one translation per user at a time, and at most
+    TRANSLATION_DAILY_LIMIT (30) started per user per day (bot TIMEZONE)
+  → STT (ElevenLabs scribe, no language hint) if voice
+  → translate.translate(text, users.language, native)   → {translation, explanation}
+      # gpt-4o; user text inside <message> tags (tags in it stripped); explanation "" unless needed
+  → reply: transcript (voice only) + bold translation + optional "why"
+  → translate.voice_note → ElevenLabs TTS (random native voice) → ffmpeg ogg
+      → sent as a voice reply; skipped silently if no voice pool / TTS fails
+```
+Stateless: nothing is written to the DB; the daily counter lives in memory and
+resets on restart. Because an exercise outlives the
+practice itself (see §3.3), voice messages go to the tutor, not to translation,
+until the next patch or practice replaces it.
+
 ## 4. Schema (SQLite, `db.py:init_db`)
 
 ```
@@ -148,7 +169,9 @@ see Known issues #1.
 | OpenAI | gpt-4o-mini | pool expansion | per patch, ~1 call |
 | OpenAI | gpt-4o | practice: sentence, theory, **every learner turn** (with up to 20-turn history) | per tap; unbounded per user |
 | ElevenLabs TTS | multilingual_v2 | pool expansion | per patch, per character |
-| ElevenLabs STT | scribe | every voice reply | per second of audio |
+| ElevenLabs STT | scribe | every voice reply / voice to translate | per second of audio |
+| OpenAI | gpt-4o | free translation, every message outside practice | per message; input ≤ 1000 chars |
+| ElevenLabs TTS | multilingual_v2 | voicing each free translation | per character (≤ 1000) |
 | Telegram | — | everything | free |
 
 There is no per-user rate limit or daily quota anywhere. Pool expansion itself
@@ -159,6 +182,12 @@ toggling does not refire once a tier is stocked. Worst case is one
 `topup_count` (10) batch per tier — 16 languages × 4 tiers ≈ 640 items total —
 a bounded, one-time cost shared across every user, not an unbounded per-user
 spend.
+
+Free translation (§3.4) is a second per-user vector: each message outside
+practice costs one `gpt-4o` call plus one TTS call. It is bounded per message
+(60 s voice, 1000 chars in and out), serialised per user and capped at
+`TRANSLATION_DAILY_LIMIT` (30) per user per day — an in-memory counter, so a
+restart resets it.
 
 The actual unbounded vector is the practice conversation: every learner turn
 (voice or text) costs one `gpt-4o` call carrying up to 20 turns of history,
@@ -173,8 +202,10 @@ per user, with no daily cap. A user holding a long conversation, or tapping
   `ELEVENLABS_API_KEY` (+ optional STT key).
 - Observability: admin DM on start/stop; heartbeat URL pinged every 60 s;
   `/stats` admin command. No structured metrics, no error aggregation.
-- Testing: none automated. `.agents/skills/testing-lingua-patch/SKILL.md`
-  describes a manual/mocked procedure. `ruff` passes.
+- Testing: `tests/` has the first pytest suite (`test_translate.py`, no network);
+  `evals/translate/cases.json` has prompt cases awaiting a runner. Otherwise
+  `.agents/skills/testing-lingua-patch/SKILL.md` describes a manual/mocked
+  procedure. `ruff` passes.
 
 ## 7. Known issues (ordered by how much they block the roadmap)
 
