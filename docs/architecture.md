@@ -95,22 +95,6 @@ learner sends voice / text
 ```
 The exercise lives until the next practice or the next delivered patch.
 
-### 3.4 Free translation (outside practice)
-
-```
-learner sends voice / text, no active exercise (and not awaiting a /time value)
-  → _translating guard: one translation per user at a time
-  → STT (ElevenLabs scribe, no language hint) if voice
-  → translate.translate(text, users.language, native)   → {translation, explanation}
-      # gpt-4o; user text inside <message> tags; explanation "" unless needed
-  → reply: transcript (voice only) + bold translation + optional "why"
-  → translate.voice_note → ElevenLabs TTS (random native voice) → ffmpeg ogg
-      → sent as a voice reply; skipped silently if no voice pool / TTS fails
-```
-Stateless: nothing is written to the DB. Because an exercise outlives the
-practice itself (see §3.3), voice messages go to the tutor, not to translation,
-until the next patch or practice replaces it.
-
 **Rich messages, with a fallback.** The task and theory are sent via
 Telegram's `SendRichMessage`/`EditMessageText` API (`InputRichMessage`) so the
 theory's collapsible blocks (`<details>`, tables) render properly. If Telegram
@@ -119,6 +103,24 @@ HTML built by `speaking.build_*_fallback_html`, which renders each block as an
 expandable blockquote instead of `<details>`/`<table>`. Every rich send in the
 practice flow — the task, the theory, and any mid-conversation notes — has a
 matching fallback path.
+
+### 3.4 Free translation (outside practice)
+
+```
+learner sends voice, or text while not awaiting a /time value; no active exercise
+  → _claim_translation: one translation per user at a time, and at most
+    TRANSLATION_DAILY_LIMIT (30) started per user per day (bot TIMEZONE)
+  → STT (ElevenLabs scribe, no language hint) if voice
+  → translate.translate(text, users.language, native)   → {translation, explanation}
+      # gpt-4o; user text inside <message> tags (tags in it stripped); explanation "" unless needed
+  → reply: transcript (voice only) + bold translation + optional "why"
+  → translate.voice_note → ElevenLabs TTS (random native voice) → ffmpeg ogg
+      → sent as a voice reply; skipped silently if no voice pool / TTS fails
+```
+Stateless: nothing is written to the DB; the daily counter lives in memory and
+resets on restart. Because an exercise outlives the
+practice itself (see §3.3), voice messages go to the tutor, not to translation,
+until the next patch or practice replaces it.
 
 ## 4. Schema (SQLite, `db.py:init_db`)
 
@@ -183,7 +185,9 @@ spend.
 
 Free translation (§3.4) is a second per-user vector: each message outside
 practice costs one `gpt-4o` call plus one TTS call. It is bounded per message
-(60 s voice, 1000 chars in and out) and serialised per user, but not per day.
+(60 s voice, 1000 chars in and out), serialised per user and capped at
+`TRANSLATION_DAILY_LIMIT` (30) per user per day — an in-memory counter, so a
+restart resets it.
 
 The actual unbounded vector is the practice conversation: every learner turn
 (voice or text) costs one `gpt-4o` call carrying up to 20 turns of history,

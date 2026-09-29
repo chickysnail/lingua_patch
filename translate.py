@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tempfile
 from html import escape
 from pathlib import Path
@@ -52,6 +53,8 @@ _SYSTEM_TEMPLATE = (
     'Respond ONLY with JSON: {{"translation": "the {target_name} version", '
     '"explanation": "in {native_name}, or an empty string"}}'
 )
+
+_DELIMITER = re.compile(r"</?\s*message\s*>", re.IGNORECASE)
 
 # Section headings per native language.
 _LABELS: dict[str, dict[str, str]] = {
@@ -98,7 +101,8 @@ def translate(
         native_name=_native_name(native_language),
         target_name=_target_name(language),
     )
-    message = _clip(text, MAX_INPUT_CHARS)
+    # Strip our own delimiter so the text cannot close the tag early.
+    message = _clip(_DELIMITER.sub("", text), MAX_INPUT_CHARS)
     resp = client.chat.completions.create(
         model=settings.openai_exercise_model,
         messages=[

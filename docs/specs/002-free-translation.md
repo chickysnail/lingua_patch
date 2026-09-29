@@ -1,5 +1,9 @@
-# 001 — Translate messages sent outside practice
+# 002 — Translate messages sent outside practice
 Status: implemented
+
+(Written alongside the implementation; the owner confirmed the decisions —
+target language, native-language explanation, text too, voiced reply, daily
+cap — in the implementing session. 001 is taken by the closed tutor-memory PR.)
 
 ## Why
 Outside a practice session the bot ignores typed text and answers a voice
@@ -37,14 +41,20 @@ language they are learning, with a short note on why when it is not obvious.
   patch arrives. Ending practice explicitly is a separate spec.
 - Bursts: one translation per user at a time (`_translating`); a second
   message during one gets "still translating".
+- Daily cap: at most `TRANSLATION_DAILY_LIMIT` (default 30) translations
+  started per user per day in the bot timezone; past it the user is told to
+  come back tomorrow. The counter is in memory, so a restart resets it.
+- A voice message while `/time` is pending is translated; only typed text is
+  read as the time.
 - Input is capped at 1000 chars before the prompt, and voice at 60 s, which
-  bounds the per-message cost. There is still no per-user daily cap (Known issue #5).
-- User text reaches the prompt inside `<message>` tags, and the system
-  prompt says it is data, not instructions.
+  bounds the per-message cost.
+- User text reaches the prompt inside `<message>` tags (any such tags in it
+  are stripped first), and the system prompt says it is data, not instructions.
 
 ## Done when
 - `tests/test_translate.py`: parsing, bad payloads, escaping, routing
-  (voice/text in and out of practice, awaiting time, busy guard).
+  (voice/text in and out of practice, awaiting time, busy guard, daily cap),
+  and the reply/voice paths of `_translate_and_reply`.
 - `evals/translate/cases.json`: explanation-only-when-needed, pt-PT vs pt-BR,
   injection, already-in-target.
 - `docs/architecture.md` has the new flow and cost row.

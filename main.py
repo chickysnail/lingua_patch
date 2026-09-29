@@ -13,7 +13,7 @@ import html
 import logging
 import random
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -902,10 +902,8 @@ async def on_voice(message: Message, bot: Bot) -> None:
             await _reply_in_session(message, bot, status, exercise, text, "voice")
         return
 
-    if user_id in _translating:
-        await message.answer(ALREADY_TRANSLATING_TEXT)
+    if not await _claim_translation(message):
         return
-    _translating.add(user_id)
     try:
         text, status = await _transcribe(message, bot)
         if text:
@@ -919,9 +917,40 @@ async def on_voice(message: Message, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 ALREADY_TRANSLATING_TEXT = "Ещё перевожу предыдущее сообщение, подожди немного 🙏"
 
+TRANSLATION_LIMIT_TEXT = (
+    "На сегодня лимит переводов исчерпан 🙏 Возвращайся завтра — "
+    "а практика по-прежнему работает."
+)
+
 # Users whose message is being translated right now — one at a time each, so a
 # burst of messages cannot fan out into parallel OpenAI + ElevenLabs calls.
 _translating: set[int] = set()
+
+# user_id -> (day in the bot TIMEZONE, translations started that day). In
+# memory only, so a restart resets it; good enough to stop runaway spend.
+_translation_counts: dict[int, tuple[date, int]] = {}
+
+
+async def _claim_translation(message: Message) -> bool:
+    """Reserve a translation for this user, or tell them why not.
+
+    On success the user is marked busy in ``_translating`` and today's count
+    goes up; the caller must discard the user from ``_translating`` when done.
+    """
+    user_id = message.from_user.id
+    if user_id in _translating:
+        await message.answer(ALREADY_TRANSLATING_TEXT)
+        return False
+    today = datetime.now(ZoneInfo(settings.timezone)).date()
+    day, used = _translation_counts.get(user_id, (today, 0))
+    if day != today:
+        used = 0
+    if used >= settings.translation_daily_limit:
+        await message.answer(TRANSLATION_LIMIT_TEXT)
+        return False
+    _translation_counts[user_id] = (today, used + 1)
+    _translating.add(user_id)
+    return True
 
 
 async def _send_translation_voice(message: Message, text: str, language: str) -> None:
@@ -1155,10 +1184,8 @@ async def on_text(message: Message, bot: Bot) -> None:
         if exercise:
             await _reply_in_session(message, bot, None, exercise, message.text, "text")
             return
-        if user_id in _translating:
-            await message.answer(ALREADY_TRANSLATING_TEXT)
+        if not await _claim_translation(message):
             return
-        _translating.add(user_id)
         try:
             await _translate_and_reply(message, bot, None, message.text, "text")
         finally:
