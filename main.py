@@ -42,6 +42,8 @@ from apscheduler.triggers.date import DateTrigger
 
 import db
 import speaking
+import translate
+import tts
 from config import settings
 from formatting import build_message, vocab_list
 from languages import LANGUAGES, get, is_supported
@@ -827,22 +829,13 @@ async def _reply_in_session(
             log.exception("Failed to send follow-up notes for user %s", user_id)
 
 
-@router.message(F.voice)
-async def on_voice(message: Message, bot: Bot) -> None:
-    """Accept a voice turn in the current speaking exercise."""
-    user_id = message.from_user.id
-    if message.voice.duration > MAX_VOICE_DURATION_SECONDS:
-        await message.answer(
-            "Голосовое слишком длинное. Запиши ответ до 1 минуты и попробуй ещё раз."
-        )
-        return
-    exercise = db.get_active_exercise(user_id)
-    if not exercise:
-        await message.answer(
-            f"Сначала нажми «{PRACTICE_TEXT}», чтобы начать упражнение."
-        )
-        return
+async def _transcribe(message: Message, bot: Bot) -> tuple[str | None, Message | None]:
+    """Download and transcribe a voice message, telling the user what went wrong.
 
+    Returns the transcript (None when there is nothing to answer) and the
+    "listening" placeholder, which the caller replaces with its answer.
+    """
+    user_id = message.from_user.id
     try:
         status: Message | None = await message.answer("🎧 Слушаю…")
     except TelegramBadRequest:
@@ -856,39 +849,135 @@ async def on_voice(message: Message, bot: Bot) -> None:
         except Exception:
             log.exception("Failed to download voice from user %s", user_id)
             await _replace(status, message, "Не удалось скачать голосовое. Попробуй ещё раз.")
-            return
+            return None, status
 
         try:
-            # No language hint: the learner may be attempting the sentence in
-            # the target language or asking about it in their own.
+            # No language hint: in practice the learner may be attempting the
+            # sentence in the target language or asking about it in their own,
+            # and a message to translate can be in any language.
             text = await asyncio.to_thread(speaking.transcribe_voice, audio_path)
         except speaking.STTConfigurationError as exc:
             log.exception("STT configuration failed for user %s", user_id)
             await _replace(
                 status,
                 message,
-                "Проверка голосового ответа пока не настроена. Попробуй позже.",
+                "Распознавание голосовых пока не настроено. Попробуй позже.",
             )
             await _notify_admin_stt_failure(bot, user_id, "STT configuration failed", exc)
-            return
+            return None, status
         except speaking.STTError as exc:
             log.exception("STT failed for user %s", user_id)
             await _replace(status, message, "Не удалось распознать речь. Попробуй ещё раз.")
             await _notify_admin_stt_failure(bot, user_id, "STT failed", exc)
-            return
+            return None, status
         except Exception as exc:
             log.exception("Unexpected STT failure for user %s", user_id)
             await _replace(status, message, "Не удалось распознать речь. Попробуй ещё раз.")
             await _notify_admin_stt_failure(bot, user_id, "Unexpected STT failure", exc)
-            return
+            return None, status
     finally:
         audio_path.unlink(missing_ok=True)
 
     if not text:
         await _replace(status, message, "Я ничего не услышал. Попробуй ещё раз.")
+        return None, status
+    return text, status
+
+
+@router.message(F.voice)
+async def on_voice(message: Message, bot: Bot) -> None:
+    """A voice turn in the current speaking exercise, or, outside one, something
+    to translate into the language the learner is studying."""
+    user_id = message.from_user.id
+    if message.voice.duration > MAX_VOICE_DURATION_SECONDS:
+        await message.answer(
+            "Голосовое слишком длинное. Запиши его до 1 минуты и попробуй ещё раз."
+        )
+        return
+    db.upsert_user(user_id)
+    exercise = db.get_active_exercise(user_id)
+    if exercise:
+        text, status = await _transcribe(message, bot)
+        if text:
+            await _reply_in_session(message, bot, status, exercise, text, "voice")
         return
 
-    await _reply_in_session(message, bot, status, exercise, text, "voice")
+    if user_id in _translating:
+        await message.answer(ALREADY_TRANSLATING_TEXT)
+        return
+    _translating.add(user_id)
+    try:
+        text, status = await _transcribe(message, bot)
+        if text:
+            await _translate_and_reply(message, bot, status, text, "voice")
+    finally:
+        _translating.discard(user_id)
+
+
+# --------------------------------------------------------------------------- #
+# Free translation (outside practice)
+# --------------------------------------------------------------------------- #
+ALREADY_TRANSLATING_TEXT = "Ещё перевожу предыдущее сообщение, подожди немного 🙏"
+
+# Users whose message is being translated right now — one at a time each, so a
+# burst of messages cannot fan out into parallel OpenAI + ElevenLabs calls.
+_translating: set[int] = set()
+
+
+async def _send_translation_voice(message: Message, text: str, language: str) -> None:
+    """Voice the translation as a reply; the text is already sent, so a failure
+    here is logged and otherwise ignored."""
+    if not tts.has_native_voices(language):
+        return
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        ogg_path = Path(tmp.name)
+    try:
+        await asyncio.to_thread(translate.voice_note, text, language, ogg_path)
+        await message.reply_voice(FSInputFile(ogg_path))
+    except Exception:
+        log.warning(
+            "Failed to voice translation for user %s", message.from_user.id, exc_info=True
+        )
+    finally:
+        ogg_path.unlink(missing_ok=True)
+
+
+async def _translate_and_reply(
+    message: Message,
+    bot: Bot,
+    status: Message | None,
+    text: str,
+    kind: str,
+) -> None:
+    """Translate a message sent outside practice into the learner's target
+    language, explain it if needed, then voice the translation."""
+    user_id = message.from_user.id
+    user = db.get_user(user_id) or {}
+    language = user.get("language", settings.default_language)
+    native = user.get("native_language", settings.native_language)
+    if status is None:
+        try:
+            await bot.send_chat_action(user_id, "typing")
+        except TelegramBadRequest:
+            pass
+    try:
+        result = await asyncio.to_thread(translate.translate, text, language, native)
+    except Exception:
+        log.exception("Translation failed for user %s", user_id)
+        await _replace(status, message, "Не удалось перевести. Попробуй ещё раз.")
+        return
+    if not result["translation"]:
+        await _replace(status, message, "Не удалось перевести. Попробуй ещё раз.")
+        return
+
+    await _replace(
+        status,
+        message,
+        translate.build_translation_html(
+            result, native, transcription=text if kind == "voice" else None
+        ),
+    )
+    await _send_translation_voice(message, result["translation"], language)
 
 
 # --------------------------------------------------------------------------- #
@@ -1051,18 +1140,29 @@ def _parse_time(text: str) -> str | None:
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, bot: Bot) -> None:
-    """Free text: a custom delivery time, or a turn in the practice session.
+    """Free text: a custom delivery time, a turn in the practice session, or
+    otherwise something to translate into the language the learner is studying.
 
     Voice is the way to practise, so typing is never advertised — but a typed
     message during an exercise is still part of that conversation (usually a
     question about it).
     """
-    db.upsert_user(message.from_user.id)
-    user = db.get_user(message.from_user.id)
+    user_id = message.from_user.id
+    db.upsert_user(user_id)
+    user = db.get_user(user_id)
     if not user.get("awaiting_time"):
-        exercise = db.get_active_exercise(message.from_user.id)
+        exercise = db.get_active_exercise(user_id)
         if exercise:
             await _reply_in_session(message, bot, None, exercise, message.text, "text")
+            return
+        if user_id in _translating:
+            await message.answer(ALREADY_TRANSLATING_TEXT)
+            return
+        _translating.add(user_id)
+        try:
+            await _translate_and_reply(message, bot, None, message.text, "text")
+        finally:
+            _translating.discard(user_id)
         return
     parsed = _parse_time(message.text)
     if parsed is None:
